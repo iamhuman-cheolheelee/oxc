@@ -114,8 +114,8 @@ impl<'a> TriviaBuilder<'a> {
         self.irregular_whitespaces.push(Span::new(start, end));
     }
 
-    pub fn add_line_comment(&mut self, start: u32, end: u32, source_text: &str) {
-        self.add_comment(Comment::new(start, end, CommentKind::Line), source_text);
+    pub fn add_line_comment(&mut self, start: u32, end: u32, kind: CommentKind, source_text: &str) {
+        self.add_comment(Comment::new(start, end, kind), source_text);
     }
 
     pub fn add_block_comment(
@@ -664,6 +664,32 @@ token /* Trailing 1 */
             },
         ];
         assert_eq!(comments, expected);
+    }
+
+    #[test]
+    fn html_comment_content() {
+        for marker in ["<!--", "-->"] {
+            for content in ["", "a", " text ", "😀", "<!-- -->"] {
+                for line_ending in ["", "\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+                    let allocator = Allocator::default();
+                    let source_text = format!("'😀';\n{marker}{content}{line_ending}");
+                    let source_type = SourceType::default().with_script(true);
+                    let ret = Parser::new(&allocator, &source_text, source_type).parse();
+                    assert!(ret.diagnostics.is_empty(), "{source_text:?}");
+
+                    let comments = &ret.program.comments;
+                    assert_eq!(comments.len(), 1);
+                    let comment = &comments[0];
+                    assert!(comment.is_line());
+                    assert!(!comment.is_block());
+                    assert_eq!(
+                        comment.span.source_text(&source_text),
+                        format!("{marker}{content}")
+                    );
+                    assert_eq!(comment.content_span().source_text(&source_text), content);
+                }
+            }
+        }
     }
 
     #[test]
