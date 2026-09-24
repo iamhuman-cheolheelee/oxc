@@ -714,6 +714,47 @@ impl InferenceState {
             .fold(0, |count, next| (count + next).min(2))
     }
 
+    fn first_argument_is_nonempty_iterable(&self, args: &[PlaceOrSpread]) -> bool {
+        for arg in args {
+            match arg {
+                PlaceOrSpread::Place(place) => return self.is_nonempty_iterable(place.identifier),
+                PlaceOrSpread::Spread(spread) => {
+                    let source = spread.place.identifier;
+                    if self.minimum_iterable_length(source) > 0 {
+                        if let Some(value) = self.constant(source)
+                            && value.kind == ConstantKind::String
+                        {
+                            // A nonempty string supplies a nonempty first character.
+                            return true;
+                        }
+                        return self.select_property(source, "0").is_some_and(|values| {
+                            !values.is_empty()
+                                && values.iter().all(|value| {
+                                    self.has_allocation_fact(
+                                        value,
+                                        &mut FxHashSet::default(),
+                                        &self.nonempty_iterable_values,
+                                    )
+                                })
+                        });
+                    }
+                    let Some(roots) = self.property_roots(source) else { return false };
+                    if roots.is_empty()
+                        || !roots.iter().all(|root| {
+                            self.collection_kinds.get(&root) == Some(&CollectionKind::Array)
+                                && self.default_collection_prototypes.contains(&root)
+                                && self.known_properties.get(&root).is_some_and(FxHashMap::is_empty)
+                        })
+                    {
+                        return false;
+                    }
+                    // A proven empty spread does not occupy an argument slot.
+                }
+            }
+        }
+        false
+    }
+
     fn array_argument_is_nonzero(&self, argument: IdentifierId) -> bool {
         self.constant(argument).is_some_and(|value| {
             value.kind != ConstantKind::Number || value.positive_array_length()
@@ -2079,8 +2120,7 @@ fn infer_block<'a>(
                         )
                     } else {
                         // Deduplication cannot make a nonempty collection empty.
-                        Some(matches!(args.first(), Some(PlaceOrSpread::Place(place))
-                            if state.is_nonempty_iterable(place.identifier)))
+                        Some(state.first_argument_is_nonempty_iterable(args))
                     }
                 }
                 _ => None,
