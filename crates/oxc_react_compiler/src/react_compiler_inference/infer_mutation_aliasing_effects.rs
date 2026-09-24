@@ -574,6 +574,8 @@ struct InferenceState {
     captured_values: FxHashMap<ValueId, ValueIdSet>,
     /// Allocations that may denote the same runtime object.
     aliased_values: FxHashMap<ValueId, ValueIdSet>,
+    /// Exact emptiness is needed to distinguish newly created holes from unknown slots.
+    empty_arrays: FxHashSet<ValueId>,
     known_properties: KnownProperties,
     property_keys: FxHashMap<ValueId, Constant>,
     exact_property_loads: FxHashSet<ValueId>,
@@ -598,6 +600,7 @@ impl InferenceState {
             multiple_iterable_values: FxHashSet::default(),
             captured_values: FxHashMap::default(),
             aliased_values: FxHashMap::default(),
+            empty_arrays: FxHashSet::default(),
             known_properties: KnownProperties::default(),
             property_keys: FxHashMap::default(),
             exact_property_loads: FxHashSet::default(),
@@ -1168,6 +1171,7 @@ impl InferenceState {
     fn invalidate_nonempty_iterables(&mut self, place: IdentifierId, transitive: bool) {
         if self.nonempty_iterable_values.is_empty()
             && self.nonempty_results.is_empty()
+            && self.empty_arrays.is_empty()
             && self.known_properties.is_empty()
             && self.default_collection_prototypes.is_empty()
         {
@@ -1181,6 +1185,7 @@ impl InferenceState {
             }
             self.nonempty_iterable_values.remove(&value);
             self.multiple_iterable_values.remove(&value);
+            self.empty_arrays.remove(&value);
             self.known_properties.remove(&value);
             self.builtin_collection_methods.remove(&value);
             self.default_collection_prototypes.remove(&value);
@@ -1333,6 +1338,8 @@ impl InferenceState {
             &self.multiple_iterable_values,
             &other.multiple_iterable_values,
         );
+        let empty_arrays =
+            self.merged_allocation_facts(other, &self.empty_arrays, &other.empty_arrays);
         let known_properties = self.merged_known_properties(other);
         let property_keys = self.merged_property_keys(other);
         let mut collection_kinds = self.collection_kinds.clone();
@@ -1357,6 +1364,7 @@ impl InferenceState {
             && nonempty_results == self.nonempty_results
             && nonempty_iterable_values == self.nonempty_iterable_values
             && multiple_iterable_values == self.multiple_iterable_values
+            && empty_arrays == self.empty_arrays
             && known_properties == self.known_properties
             && property_keys == self.property_keys
             && collection_kinds == self.collection_kinds
@@ -1373,6 +1381,7 @@ impl InferenceState {
                 nonempty_iterable_values,
                 nonempty_results,
                 multiple_iterable_values,
+                empty_arrays,
                 known_properties,
                 property_keys,
                 collection_kinds,
@@ -1460,6 +1469,8 @@ impl InferenceState {
             &self.multiple_iterable_values,
             &other.multiple_iterable_values,
         );
+        self.empty_arrays =
+            self.merged_allocation_facts(other, &self.empty_arrays, &other.empty_arrays);
         self.known_properties = self.merged_known_properties(other);
         self.property_keys = self.merged_property_keys(other);
         self.collection_kinds.extend(other.collection_kinds.iter().map(|(&id, &kind)| (id, kind)));
@@ -2152,6 +2163,9 @@ fn update_iterable_properties(
                 .collect();
             for object in state.values_for(instruction.lvalue.identifier) {
                 state.known_properties.insert(object, fields.clone());
+                if elements.is_empty() {
+                    state.empty_arrays.insert(object);
+                }
                 state.refresh_property_captures(object);
             }
         }
@@ -2484,6 +2498,22 @@ fn infer_block<'a>(
             .map(|(kind, _)| kind)
             .or_else(|| copied_array_length.map(|_| CollectionKind::Array));
         let array_factory = collection_constructor.and_then(|(_, factory)| factory);
+        let sparse_array_length = if collection_constructor == Some((CollectionKind::Array, None)) {
+            match &instruction.value {
+                InstructionValue::NewExpression { args, .. }
+                | InstructionValue::CallExpression { args, .. } => match args.as_slice() {
+                    [] => Some(0),
+                    [PlaceOrSpread::Place(place)] => state
+                        .constant(place.identifier)
+                        .filter(|value| value.kind == ConstantKind::Number)
+                        .and_then(|value| value.array_length()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
         let nonempty_iterable = if context.track_nonempty_iterables {
             match &instruction.value {
                 InstructionValue::ArrayExpression { .. } => {
@@ -2629,6 +2659,7 @@ fn infer_block<'a>(
             Vec::new()
         };
 
+        let mut written_array_lengths = Vec::new();
         let mut preserved_insert = Vec::new();
         let mut preserved_prototypes = Vec::new();
         let mut preserved_nonempty_collections = Vec::new();
@@ -2667,6 +2698,21 @@ fn infer_block<'a>(
             for value in objects.iter() {
                 let Some(&kind) = state.collection_kinds.get(&value) else { continue };
                 if state.default_collection_prototypes.contains(&value) {
+                    if kind == CollectionKind::Array
+                        && objects.as_slice().len() == 1
+                        && key == "length"
+                        && let InstructionValue::PropertyStore { value: length, .. }
+                        | InstructionValue::ComputedStore { value: length, .. } =
+                            &instruction.value
+                        && let Some(length) =
+                            state.constant(length.identifier).and_then(|value| value.array_length())
+                    {
+                        written_array_lengths.push((
+                            value,
+                            length,
+                            state.empty_arrays.contains(&value),
+                        ));
+                    }
                     preserved_prototypes.push(value);
                     if (kind == CollectionKind::Array
                         && ((writes_index && key != "0") || writes_multiple_length))
@@ -2729,6 +2775,36 @@ fn infer_block<'a>(
                 selected_values,
                 preserved_properties,
             );
+        }
+        for (value, length, was_empty) in written_array_lengths {
+            let properties = state.known_properties.entry(value).or_default();
+            // Truncation deletes indexed fields; later growth creates holes.
+            properties.retain(|key, _| {
+                !key.parse::<u32>().is_ok_and(|index| {
+                    index != u32::MAX && index.to_string() == *key && index >= length
+                })
+            });
+            if length == 0 {
+                state.empty_arrays.insert(value);
+            } else if was_empty {
+                for index in 0..length.min(2) {
+                    properties.insert(index.to_string(), ValueIdSet::default());
+                }
+            }
+            state.refresh_property_captures(value);
+        }
+        if let Some(length) = sparse_array_length {
+            for value in state.values_for(instruction.lvalue.identifier) {
+                if length == 0 {
+                    state.empty_arrays.insert(value);
+                }
+                state.known_properties.insert(
+                    value,
+                    (0..length.min(2))
+                        .map(|index| (index.to_string(), ValueIdSet::default()))
+                        .collect(),
+                );
+            }
         }
         if let Some(kind) = constructed_collection {
             for value in state.values_for(instruction.lvalue.identifier) {

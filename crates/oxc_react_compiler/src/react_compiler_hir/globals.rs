@@ -844,7 +844,7 @@ const BUILTIN_SHAPE_DEFS: &[ShapeDef] = &[
                     aliasing: Some(&AliasingSignatureConfig {
                         receiver: "@receiver",
                         params: &["@key", "@value"],
-                        rest: None,
+                        rest: Some("@ignored"),
                         returns: "@returns",
                         temporaries: &[],
                         effects: &[
