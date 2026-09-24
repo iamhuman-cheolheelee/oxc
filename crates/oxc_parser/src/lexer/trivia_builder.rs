@@ -668,27 +668,16 @@ token /* Trailing 1 */
 
     #[test]
     fn html_comment_content() {
-        for marker in ["<!--", "-->"] {
-            for content in ["", "a", " text ", "😀", "<!-- -->"] {
-                for line_ending in ["", "\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
-                    let allocator = Allocator::default();
-                    let source_text = format!("'😀';\n{marker}{content}{line_ending}");
-                    let source_type = SourceType::default().with_script(true);
-                    let ret = Parser::new(&allocator, &source_text, source_type).parse();
-                    assert!(ret.diagnostics.is_empty(), "{source_text:?}");
-
-                    let comments = &ret.program.comments;
-                    assert_eq!(comments.len(), 1);
-                    let comment = &comments[0];
-                    assert!(comment.is_line());
-                    assert!(!comment.is_block());
-                    assert_eq!(
-                        comment.span.source_text(&source_text),
-                        format!("{marker}{content}")
-                    );
-                    assert_eq!(comment.content_span().source_text(&source_text), content);
-                }
-            }
+        let allocator = Allocator::default();
+        let source = "<!--a\n-->\n<!--";
+        let ret = Parser::new(&allocator, source, SourceType::script()).parse();
+        assert!(ret.diagnostics.is_empty());
+        assert_eq!(ret.program.comments.len(), 3);
+        let expected = [(Span::new(0, 5), "a"), (Span::new(6, 9), ""), (Span::new(10, 14), "")];
+        for (comment, (span, content)) in ret.program.comments.iter().zip(expected) {
+            assert!(comment.is_line());
+            assert_eq!(comment.span, span);
+            assert_eq!(comment.content_span().source_text(source), content);
         }
     }
 

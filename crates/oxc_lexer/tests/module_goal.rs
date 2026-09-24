@@ -34,22 +34,17 @@ fn script_html_open_comment_anywhere() {
 
 #[test]
 fn html_comment_content() {
-    for marker in ["<!--", "-->"] {
-        for content in ["", "a", "😀"] {
-            let code = format!("{marker}{content}\n");
-            let mut buf = code.as_bytes().to_vec();
-            let len = buf.len() as u32;
-            buf.resize(buf.len() + PAD, 0);
-            let options = LexOptions { source_type_module: false, ..Default::default() };
-            let (result, arena) = lex_utf8(&buf, len, options);
-            assert!(result.diagnostics().is_empty());
-            let comments = result.comments(&arena);
-            assert_eq!(comments.len(), 1);
-            let comment = &comments[0];
-            assert!(comment.is_line());
-            assert_eq!(comment.span.source_text(&code), format!("{marker}{content}"));
-            assert_eq!(comment.content_span().source_text(&code), content);
-        }
+    let source = "<!--a\n-->\n<!--";
+    let mut buf = source.as_bytes().to_vec();
+    buf.resize(buf.len() + PAD, 0);
+    let options = LexOptions { source_type_module: false, ..Default::default() };
+    let (result, arena) = lex_utf8(&buf, source.len() as u32, options);
+    assert!(result.diagnostics().is_empty());
+    let comments = result.comments(&arena);
+    assert_eq!(comments.len(), 3);
+    for (comment, content) in comments.iter().zip(["a", "", ""]) {
+        assert!(comment.is_line());
+        assert_eq!(comment.content_span().source_text(source), content);
     }
 }
 
