@@ -505,6 +505,7 @@ const BUILTIN_SHAPE_DEFS: &[ShapeDef] = &[
             Method(
                 "concat",
                 MethodDef {
+                    canonical_name: Some("Array.concat"),
                     rest_param: Some(Effect::Capture),
                     return_type: TypeDef::Object(BUILT_IN_ARRAY_ID),
                     return_value_kind: ValueKind::Mutable,
@@ -840,6 +841,19 @@ const BUILTIN_SHAPE_DEFS: &[ShapeDef] = &[
                     callee_effect: Effect::Store,
                     return_type: TypeDef::Object(BUILT_IN_MAP_ID),
                     return_value_kind: ValueKind::Mutable,
+                    aliasing: Some(&AliasingSignatureConfig {
+                        receiver: "@receiver",
+                        params: &["@key", "@value"],
+                        rest: None,
+                        returns: "@returns",
+                        temporaries: &[],
+                        effects: &[
+                            AliasingEffectConfig::Assign { from: "@receiver", into: "@returns" },
+                            AliasingEffectConfig::Mutate { value: "@receiver" },
+                            AliasingEffectConfig::Capture { from: "@key", into: "@receiver" },
+                            AliasingEffectConfig::Capture { from: "@value", into: "@receiver" },
+                        ],
+                    }),
                     ..MethodDef::DEFAULT
                 },
             ),

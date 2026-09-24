@@ -485,6 +485,7 @@ impl CollectionKind {
                 collection_method_bit("push")
                     | collection_method_bit("unshift")
                     | collection_method_bit("map")
+                    | collection_method_bit("concat")
             }
             Self::Set => collection_method_bit("add"),
             Self::Map => collection_method_bit("set"),
@@ -498,6 +499,7 @@ fn collection_method_bit(method: &str) -> u8 {
         "push" | "Array.push" => 1,
         "unshift" | "Array.unshift" => 2,
         "map" | "Array.map" => 16,
+        "concat" | "Array.concat" => 32,
         "add" | "Set.add" => 4,
         "set" | "Map.set" => 8,
         _ => 0,
@@ -2272,22 +2274,23 @@ fn infer_block<'a>(
         } else {
             None
         };
-        // Array.map snapshots the source length before invoking callbacks. The
-        // result keeps that length even if callbacks shorten the source array.
-        let mapped_length = if context.track_nonempty_iterables
+        // Map snapshots the source length before callbacks; concat copies the
+        // receiver before appending arguments. Both preserve its lower bound.
+        let copied_array_length = if context.track_nonempty_iterables
             && let InstructionValue::MethodCall { receiver, property, .. } = &instruction.value
-            && env
+            && let Some(signature) = env
                 .get_function_signature(&env.types[env.identifiers[property.identifier].type_])
                 .ok()
                 .flatten()
-                .is_some_and(|signature| signature.canonical_name.as_deref() == Some("Array.map"))
+            && let Some(method @ ("Array.map" | "Array.concat")) =
+                signature.canonical_name.as_deref()
             && let Some(receivers) = state.property_roots(receiver.identifier)
             && !receivers.is_empty()
             && receivers.iter().all(|value| {
                 state
                     .builtin_collection_methods
                     .get(&value)
-                    .is_some_and(|methods| methods & collection_method_bit("map") != 0)
+                    .is_some_and(|methods| methods & collection_method_bit(method) != 0)
                     && state.default_collection_prototypes.contains(&value)
                     && !state
                         .known_properties
@@ -2300,7 +2303,7 @@ fn infer_block<'a>(
         };
         let constructed_collection = collection_constructor
             .map(|(kind, _)| kind)
-            .or_else(|| mapped_length.map(|_| CollectionKind::Array));
+            .or_else(|| copied_array_length.map(|_| CollectionKind::Array));
         let array_factory = collection_constructor.and_then(|(_, factory)| factory);
         let nonempty_iterable = if context.track_nonempty_iterables {
             match &instruction.value {
@@ -2313,8 +2316,8 @@ fn infer_block<'a>(
                 InstructionValue::TemplateLiteral { quasis, .. } => Some(
                     quasis.iter().any(|quasi| quasi.cooked.is_some_and(|value| !value.is_empty())),
                 ),
-                InstructionValue::MethodCall { .. } if mapped_length.is_some() => {
-                    mapped_length.map(|length| length > 0)
+                InstructionValue::MethodCall { .. } if copied_array_length.is_some() => {
+                    copied_array_length.map(|length| length > 0)
                 }
                 InstructionValue::NewExpression { args, .. }
                 | InstructionValue::CallExpression { args, .. }
@@ -2367,8 +2370,8 @@ fn infer_block<'a>(
                         .sum::<usize>()
                         >= 2
                 }
-                InstructionValue::MethodCall { .. } if mapped_length.is_some() => {
-                    mapped_length.is_some_and(|length| length >= 2)
+                InstructionValue::MethodCall { .. } if copied_array_length.is_some() => {
+                    copied_array_length.is_some_and(|length| length >= 2)
                 }
                 InstructionValue::NewExpression { args, .. }
                 | InstructionValue::CallExpression { args, .. }
