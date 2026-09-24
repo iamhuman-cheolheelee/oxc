@@ -565,6 +565,9 @@ struct InferenceState {
     variables: FxHashMap<IdentifierId, ValueIdSet>,
     /// Values guaranteed nonempty on every incoming path where they exist.
     nonempty_iterable_values: FxHashSet<ValueId>,
+    /// A selected insertion result is nonempty even when its allocation is ambiguous.
+    /// Dependencies invalidate this fact when any possible receiver is mutated.
+    nonempty_results: FxHashMap<IdentifierId, ValueIdSet>,
     /// Cardinality is capped at two: Array(0) is empty, but Array(0, x) is not.
     multiple_iterable_values: FxHashSet<ValueId>,
     /// Values stored inside another allocation.
@@ -591,6 +594,7 @@ impl InferenceState {
             values: FxHashMap::default(),
             variables: FxHashMap::default(),
             nonempty_iterable_values: FxHashSet::default(),
+            nonempty_results: FxHashMap::default(),
             multiple_iterable_values: FxHashSet::default(),
             captured_values: FxHashMap::default(),
             aliased_values: FxHashMap::default(),
@@ -640,10 +644,16 @@ impl InferenceState {
     }
 
     fn define(&mut self, place_id: IdentifierId, value_id: ValueId) {
+        self.nonempty_results.remove(&place_id);
         self.variables.insert(place_id, ValueIdSet::single(value_id));
     }
 
     fn assign(&mut self, into: IdentifierId, from: IdentifierId) {
+        if let Some(dependencies) = self.nonempty_results.get(&from).cloned() {
+            self.nonempty_results.insert(into, dependencies);
+        } else {
+            self.nonempty_results.remove(&into);
+        }
         let values = match self.variables.get(&from) {
             Some(v) => v.clone(),
             None => {
@@ -662,6 +672,7 @@ impl InferenceState {
     }
 
     fn append_alias(&mut self, place: IdentifierId, value: IdentifierId) {
+        self.nonempty_results.remove(&place);
         let new_values = match self.variables.get(&value) {
             Some(v) => v.clone(),
             None => return,
@@ -706,6 +717,9 @@ impl InferenceState {
     }
 
     fn is_nonempty_iterable(&self, place_id: IdentifierId) -> bool {
+        if self.nonempty_results.contains_key(&place_id) {
+            return true;
+        }
         self.variables.get(&place_id).is_some_and(|values| {
             let mut visited = FxHashSet::default();
             !values.is_empty()
@@ -727,6 +741,103 @@ impl InferenceState {
             )
         });
         if multiple { 2 } else { 1 }
+    }
+
+    fn minimum_concat_value_length(&self, value: ValueId) -> usize {
+        if self.values.get(&value).is_some_and(|value| value.kind == ValueKind::Primitive) {
+            return 1;
+        }
+        if !self.default_collection_prototypes.contains(&value) {
+            return 0;
+        }
+        match self.collection_kinds.get(&value) {
+            Some(CollectionKind::Array) => {
+                if self.multiple_iterable_values.contains(&value) {
+                    2
+                } else {
+                    usize::from(self.nonempty_iterable_values.contains(&value))
+                }
+            }
+            // Default Set and Map objects are scalar concat elements.
+            Some(CollectionKind::Set | CollectionKind::Map) => 1,
+            None => 0,
+        }
+    }
+
+    fn minimum_concat_arguments(&self, args: &[PlaceOrSpread]) -> usize {
+        let consume = |values: &ValueIdSet, trust_objects: &mut bool| {
+            let primitive = values.iter().all(|value| {
+                self.values.get(&value).is_some_and(|value| value.kind == ValueKind::Primitive)
+            });
+            let count = if *trust_objects || primitive {
+                values
+                    .iter()
+                    .map(|value| self.minimum_concat_value_length(value))
+                    .min()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            // Unknown spreadability getters can mutate later object arguments.
+            // Already-copied elements and primitive arguments remain stable.
+            *trust_objects &= primitive
+                || values.iter().all(|value| {
+                    self.default_collection_prototypes.contains(&value)
+                        && self.collection_kinds.contains_key(&value)
+                });
+            count
+        };
+        let mut count = 0;
+        let mut trust_objects = true;
+        for arg in args {
+            let next = match arg {
+                PlaceOrSpread::Place(place) => {
+                    if let Some(values) = self.property_roots(place.identifier) {
+                        consume(&values, &mut trust_objects)
+                    } else {
+                        trust_objects = false;
+                        0
+                    }
+                }
+                PlaceOrSpread::Spread(spread) => {
+                    let length = self.minimum_iterable_length(spread.place.identifier);
+                    let count = self.property_roots(spread.place.identifier).map_or(0, |values| {
+                        values
+                            .iter()
+                            .map(|value| {
+                                if self
+                                    .property_keys
+                                    .get(&value)
+                                    .is_some_and(|value| value.kind == ConstantKind::String)
+                                {
+                                    return length;
+                                }
+                                let Some(properties) = self.known_properties.get(&value) else {
+                                    return 0;
+                                };
+                                let mut trust_elements = trust_objects;
+                                (0..length)
+                                    .map(|index| {
+                                        if let Some(values) = properties.get(&index.to_string()) {
+                                            consume(values, &mut trust_elements)
+                                        } else {
+                                            trust_elements = false;
+                                            0
+                                        }
+                                    })
+                                    .sum()
+                            })
+                            .min()
+                            .unwrap_or(0)
+                    });
+                    // The lower bound does not describe any remaining arguments.
+                    trust_objects = false;
+                    count
+                }
+            };
+            count = (count + next).min(2);
+        }
+        count
     }
 
     fn minimum_argument_count(&self, args: &[PlaceOrSpread]) -> usize {
@@ -1052,6 +1163,7 @@ impl InferenceState {
 
     fn invalidate_nonempty_iterables(&mut self, place: IdentifierId, transitive: bool) {
         if self.nonempty_iterable_values.is_empty()
+            && self.nonempty_results.is_empty()
             && self.known_properties.is_empty()
             && self.default_collection_prototypes.is_empty()
         {
@@ -1075,6 +1187,8 @@ impl InferenceState {
                 pending.extend(captures.iter());
             }
         }
+        self.nonempty_results
+            .retain(|_, dependencies| !dependencies.iter().any(|value| visited.contains(&value)));
     }
 
     fn freeze(&mut self, place_id: IdentifierId, reason: ValueReason) -> bool {
@@ -1208,6 +1322,7 @@ impl InferenceState {
             }
         }
 
+        let nonempty_results = self.merged_nonempty_results(other);
         let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         let multiple_iterable_values = self.merged_allocation_facts(
             other,
@@ -1235,6 +1350,7 @@ impl InferenceState {
             && next_values.is_none()
             && next_captured_values.is_none()
             && next_aliased_values.is_none()
+            && nonempty_results == self.nonempty_results
             && nonempty_iterable_values == self.nonempty_iterable_values
             && multiple_iterable_values == self.multiple_iterable_values
             && known_properties == self.known_properties
@@ -1251,6 +1367,7 @@ impl InferenceState {
                 values: next_values.unwrap_or_else(|| self.values.clone()),
                 variables: next_variables.unwrap_or_else(|| self.variables.clone()),
                 nonempty_iterable_values,
+                nonempty_results,
                 multiple_iterable_values,
                 known_properties,
                 property_keys,
@@ -1264,6 +1381,24 @@ impl InferenceState {
                 uninitialized_access: Cell::new(None),
             })
         }
+    }
+
+    fn merged_nonempty_results(&self, other: &Self) -> FxHashMap<IdentifierId, ValueIdSet> {
+        let mut facts = self.nonempty_results.clone();
+        facts.retain(|id, dependencies| {
+            if let Some(other) = other.nonempty_results.get(id) {
+                dependencies.union_with(other);
+                true
+            } else {
+                !other.variables.contains_key(id)
+            }
+        });
+        for (&id, dependencies) in &other.nonempty_results {
+            if !self.variables.contains_key(&id) {
+                facts.insert(id, dependencies.clone());
+            }
+        }
+        facts
     }
 
     fn merged_builtin_methods(&self, other: &Self) -> FxHashMap<ValueId, u8> {
@@ -1314,6 +1449,7 @@ impl InferenceState {
     /// `merge`'s result, the access flag ends up cleared (queued states never
     /// carry a set flag: a set flag errors out before the state is queued).
     fn merge_from(&mut self, other: &InferenceState) {
+        self.nonempty_results = self.merged_nonempty_results(other);
         self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         self.multiple_iterable_values = self.merged_allocation_facts(
             other,
@@ -1386,7 +1522,16 @@ impl InferenceState {
             // If not found, it's a backedge that will be handled later by merge
         }
         if !values.is_empty() {
-            self.variables.insert(phi_place_id, values);
+            self.variables.insert(phi_place_id, values.clone());
+        }
+        if phi_operands
+            .values()
+            .any(|operand| self.nonempty_results.contains_key(&operand.identifier))
+            && phi_operands.values().all(|operand| self.is_nonempty_iterable(operand.identifier))
+        {
+            self.nonempty_results.insert(phi_place_id, values);
+        } else {
+            self.nonempty_results.remove(&phi_place_id);
         }
     }
 }
@@ -2277,7 +2422,8 @@ fn infer_block<'a>(
         // Map snapshots the source length before callbacks; concat copies the
         // receiver before appending arguments. Both preserve its lower bound.
         let copied_array_length = if context.track_nonempty_iterables
-            && let InstructionValue::MethodCall { receiver, property, .. } = &instruction.value
+            && let InstructionValue::MethodCall { receiver, property, args, .. } =
+                &instruction.value
             && let Some(signature) = env
                 .get_function_signature(&env.types[env.identifiers[property.identifier].type_])
                 .ok()
@@ -2297,7 +2443,31 @@ fn infer_block<'a>(
                         .get(&value)
                         .is_some_and(|properties| properties.contains_key("constructor"))
             }) {
-            Some(state.minimum_iterable_length(receiver.identifier))
+            let receiver_length = state.minimum_iterable_length(receiver.identifier);
+            Some(if method == "Array.concat" {
+                (receiver_length + state.minimum_concat_arguments(args)).min(2)
+            } else {
+                receiver_length
+            })
+        } else {
+            None
+        };
+        let inserted_collection = if context.track_nonempty_iterables
+            && let InstructionValue::MethodCall { receiver, property, .. } = &instruction.value
+            && let Some(signature) = env
+                .get_function_signature(&env.types[env.identifiers[property.identifier].type_])
+                .ok()
+                .flatten()
+            && let Some(method @ ("Set.add" | "Map.set")) = signature.canonical_name.as_deref()
+            && let Some(receivers) = state.property_roots(receiver.identifier)
+            && !receivers.is_empty()
+            && receivers.iter().all(|value| {
+                state
+                    .builtin_collection_methods
+                    .get(&value)
+                    .is_some_and(|methods| methods & collection_method_bit(method) != 0)
+            }) {
+            Some(receivers)
         } else {
             None
         };
@@ -2535,6 +2705,9 @@ fn infer_block<'a>(
         let effects = apply_signature(context, state, *instr_idx, instruction, env)?;
         spread_effects.extend(effects.into_iter().flatten());
         let effects = (!spread_effects.is_empty()).then_some(spread_effects);
+        if let Some(receivers) = inserted_collection {
+            state.nonempty_results.insert(instruction.lvalue.identifier, receivers);
+        }
         state.builtin_collection_methods.extend(preserved_insert);
         state.default_collection_prototypes.extend(preserved_prototypes);
         state.nonempty_iterable_values.extend(preserved_nonempty_collections);

@@ -1,0 +1,32 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-new-date-selected-result-alias.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender
+function Component(t0) {
+	const $ = _c(4);
+	const { cond } = t0;
+	let t1;
+	if ($[0] !== cond) {
+		const a = new Set();
+		const b = new Set();
+		const target = cond ? a : b;
+		t1 = target.add(0);
+		$[0] = cond;
+		$[1] = t1;
+	} else {
+		t1 = $[1];
+	}
+	const result = t1;
+	const alias = result;
+	let t2;
+	if ($[2] !== alias) {
+		t2 = new Date(...alias);
+		$[2] = alias;
+		$[3] = t2;
+	} else {
+		t2 = $[3];
+	}
+	return t2;
+}
