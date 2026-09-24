@@ -464,6 +464,12 @@ impl ValueIdSet {
 
 type KnownProperties = FxHashMap<ValueId, FxHashMap<String, ValueIdSet>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayFactory {
+    Of,
+    From,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectionKind {
     Array,
@@ -714,10 +720,12 @@ impl InferenceState {
             .fold(0, |count, next| (count + next).min(2))
     }
 
-    fn first_argument_is_nonempty_iterable(&self, args: &[PlaceOrSpread]) -> bool {
+    fn first_argument_minimum_iterable_length(&self, args: &[PlaceOrSpread]) -> usize {
         for arg in args {
             match arg {
-                PlaceOrSpread::Place(place) => return self.is_nonempty_iterable(place.identifier),
+                PlaceOrSpread::Place(place) => {
+                    return self.minimum_iterable_length(place.identifier);
+                }
                 PlaceOrSpread::Spread(spread) => {
                     let source = spread.place.identifier;
                     if self.minimum_iterable_length(source) > 0 {
@@ -725,20 +733,41 @@ impl InferenceState {
                             && value.kind == ConstantKind::String
                         {
                             // A nonempty string supplies a nonempty first character.
-                            return true;
+                            return 1;
                         }
-                        return self.select_property(source, "0").is_some_and(|values| {
-                            !values.is_empty()
-                                && values.iter().all(|value| {
-                                    self.has_allocation_fact(
-                                        value,
-                                        &mut FxHashSet::default(),
-                                        &self.nonempty_iterable_values,
-                                    )
-                                })
-                        });
+                        return self
+                            .select_property(source, "0")
+                            .filter(|values| !values.is_empty())
+                            .map_or(0, |values| {
+                                values
+                                    .iter()
+                                    .map(|value| {
+                                        if !self.has_allocation_fact(
+                                            value,
+                                            &mut FxHashSet::default(),
+                                            &self.nonempty_iterable_values,
+                                        ) {
+                                            0
+                                        } else if self.has_allocation_fact(
+                                            value,
+                                            &mut FxHashSet::default(),
+                                            &self.multiple_iterable_values,
+                                        ) {
+                                            2
+                                        } else {
+                                            1
+                                        }
+                                    })
+                                    .min()
+                                    .unwrap_or(0)
+                            });
                     }
-                    let Some(roots) = self.property_roots(source) else { return false };
+                    if self.constant(source).is_some_and(|value| {
+                        value.kind == ConstantKind::String && value.text.is_empty()
+                    }) {
+                        continue;
+                    }
+                    let Some(roots) = self.property_roots(source) else { return 0 };
                     if roots.is_empty()
                         || !roots.iter().all(|root| {
                             self.collection_kinds.get(&root) == Some(&CollectionKind::Array)
@@ -746,13 +775,13 @@ impl InferenceState {
                                 && self.known_properties.get(&root).is_some_and(FxHashMap::is_empty)
                         })
                     {
-                        return false;
+                        return 0;
                     }
                     // A proven empty spread does not occupy an argument slot.
                 }
             }
         }
-        false
+        0
     }
 
     fn array_argument_is_nonzero(&self, argument: IdentifierId) -> bool {
@@ -2051,7 +2080,7 @@ fn infer_block<'a>(
         // stores, phi joins, and mutations have been applied. A literal-only scan
         // cannot recognize [...local] or invalidate a mutated spread operand.
         let instruction = &func.instructions[instr_index];
-        let constructed_collection = if context.track_nonempty_iterables {
+        let collection_constructor = if context.track_nonempty_iterables {
             match &instruction.value {
                 InstructionValue::NewExpression { callee, .. }
                 | InstructionValue::CallExpression { callee, .. }
@@ -2060,14 +2089,18 @@ fn infer_block<'a>(
                     .ok()
                     .flatten()
                     .and_then(|signature| match signature.canonical_name.as_deref() {
-                        Some("Array") => Some(CollectionKind::Array),
+                        Some("Array") => Some((CollectionKind::Array, None)),
+                        Some("Array.of") => Some((CollectionKind::Array, Some(ArrayFactory::Of))),
+                        Some("Array.from") => {
+                            Some((CollectionKind::Array, Some(ArrayFactory::From)))
+                        }
                         Some("Set")
                             if matches!(
                                 instruction.value,
                                 InstructionValue::NewExpression { .. }
                             ) =>
                         {
-                            Some(CollectionKind::Set)
+                            Some((CollectionKind::Set, None))
                         }
                         Some("Map")
                             if matches!(
@@ -2075,7 +2108,7 @@ fn infer_block<'a>(
                                 InstructionValue::NewExpression { .. }
                             ) =>
                         {
-                            Some(CollectionKind::Map)
+                            Some((CollectionKind::Map, None))
                         }
                         _ => None,
                     }),
@@ -2084,6 +2117,8 @@ fn infer_block<'a>(
         } else {
             None
         };
+        let constructed_collection = collection_constructor.map(|(kind, _)| kind);
+        let array_factory = collection_constructor.and_then(|(_, factory)| factory);
         let nonempty_iterable = if context.track_nonempty_iterables {
             match &instruction.value {
                 InstructionValue::ArrayExpression { elements, .. } => {
@@ -2105,7 +2140,13 @@ fn infer_block<'a>(
                 | InstructionValue::MethodCall { args, .. }
                     if constructed_collection.is_some() =>
                 {
-                    if constructed_collection == Some(CollectionKind::Array) {
+                    if let Some(factory) = array_factory {
+                        Some(if factory == ArrayFactory::From {
+                            state.first_argument_minimum_iterable_length(args) > 0
+                        } else {
+                            state.minimum_argument_count(args) > 0
+                        })
+                    } else if constructed_collection == Some(CollectionKind::Array) {
                         // At least two arguments always mean elements. A single
                         // argument may instead be the numeric length zero.
                         Some(
@@ -2120,7 +2161,7 @@ fn infer_block<'a>(
                         )
                     } else {
                         // Deduplication cannot make a nonempty collection empty.
-                        Some(state.first_argument_is_nonempty_iterable(args))
+                        Some(state.first_argument_minimum_iterable_length(args) > 0)
                     }
                 }
                 _ => None,
@@ -2159,16 +2200,28 @@ fn infer_block<'a>(
                 | InstructionValue::MethodCall { args, .. }
                     if constructed_collection == Some(CollectionKind::Array) =>
                 {
-                    state.minimum_argument_count(args) >= 2
-                        || args.iter().any(|arg| match arg {
-                            PlaceOrSpread::Place(place) => {
-                                state.constant(place.identifier).is_some_and(|value| {
-                                    value.kind == ConstantKind::Number
-                                        && value.array_length().is_some_and(|length| length >= 2)
-                                })
-                            }
-                            PlaceOrSpread::Spread(_) => false,
-                        })
+                    if let Some(factory) = array_factory {
+                        if factory == ArrayFactory::From {
+                            // A mapper can shorten a live source after its first item.
+                            matches!(args.as_slice(), [PlaceOrSpread::Place(_)])
+                                && state.first_argument_minimum_iterable_length(args) >= 2
+                        } else {
+                            state.minimum_argument_count(args) >= 2
+                        }
+                    } else {
+                        state.minimum_argument_count(args) >= 2
+                            || args.iter().any(|arg| match arg {
+                                PlaceOrSpread::Place(place) => {
+                                    state.constant(place.identifier).is_some_and(|value| {
+                                        value.kind == ConstantKind::Number
+                                            && value
+                                                .array_length()
+                                                .is_some_and(|length| length >= 2)
+                                    })
+                                }
+                                PlaceOrSpread::Spread(_) => false,
+                            })
+                    }
                 }
                 _ => false,
             };

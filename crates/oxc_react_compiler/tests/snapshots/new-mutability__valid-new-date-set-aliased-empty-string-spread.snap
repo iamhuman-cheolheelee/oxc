@@ -1,0 +1,27 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-set-aliased-empty-string-spread.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(4);
+	const { timestamp } = t0;
+	let t1;
+	if ($[0] !== timestamp) {
+		t1 = new Set(..."", [timestamp]);
+		$[0] = timestamp;
+		$[1] = t1;
+	} else {
+		t1 = $[1];
+	}
+	let t2;
+	if ($[2] !== t1) {
+		t2 = new Date(...t1);
+		$[2] = t1;
+		$[3] = t2;
+	} else {
+		t2 = $[3];
+	}
+	return t2;
+}

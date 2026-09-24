@@ -1687,6 +1687,7 @@ const TYPED_GLOBAL_OBJECTS: &[GlobalObjectDef] = &[
             Method(
                 "from",
                 MethodDef {
+                    canonical_name: Some("Array.from"),
                     positional_params: &[
                         Effect::ConditionallyMutateIterator,
                         Effect::ConditionallyMutate,
@@ -1701,6 +1702,7 @@ const TYPED_GLOBAL_OBJECTS: &[GlobalObjectDef] = &[
             Method(
                 "of",
                 MethodDef {
+                    canonical_name: Some("Array.of"),
                     rest_param: Some(Effect::Read),
                     return_type: TypeDef::Object(BUILT_IN_ARRAY_ID),
                     return_value_kind: ValueKind::Mutable,
