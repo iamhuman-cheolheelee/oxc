@@ -1814,7 +1814,7 @@ fn build_typed_globals(
     // Object, Array, Math, performance, Date, console
     for def in TYPED_GLOBAL_OBJECTS {
         let id = Ident::from(def.name);
-        let global = if def.name == "Date" {
+        let global = if matches!(def.name, "Date" | "Array") {
             let properties = def
                 .props
                 .iter()
@@ -1829,16 +1829,24 @@ fn build_typed_globals(
                 shapes,
                 properties,
                 FunctionSignatureBuilder {
-                    rest_param: Some(Effect::Read),
-                    return_type: Type::Poly,
+                    rest_param: Some(if def.name == "Array" {
+                        Effect::Capture
+                    } else {
+                        Effect::Read
+                    }),
+                    return_type: if def.name == "Array" {
+                        Type::Object { shape_id: Some(BUILT_IN_ARRAY_ID) }
+                    } else {
+                        Type::Poly
+                    },
                     return_value_kind: ValueKind::Mutable,
-                    impure: true,
-                    impure_if_no_args: true,
-                    canonical_name: Some(Cow::Borrowed("Date")),
+                    impure: def.name == "Date",
+                    impure_if_no_args: def.name == "Date",
+                    canonical_name: Some(Cow::Borrowed(def.name)),
                     ..Default::default()
                 },
                 Some(id),
-                false,
+                def.name == "Array",
             )
         } else {
             add_object_from_def(shapes, Some(id), def.props)

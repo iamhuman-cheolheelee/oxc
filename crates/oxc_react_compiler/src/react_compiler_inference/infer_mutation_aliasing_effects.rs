@@ -23,6 +23,7 @@ use oxc_allocator::Allocator;
 use oxc_allocator::CloneIn;
 use oxc_allocator::Vec as ArenaVec;
 use oxc_diagnostics::OxcDiagnostic;
+use oxc_ecmascript::StringToNumber;
 
 use crate::react_compiler_hir::AliasingEffect;
 use crate::react_compiler_hir::AliasingSignature;
@@ -463,6 +464,64 @@ impl ValueIdSet {
 
 type KnownProperties = FxHashMap<ValueId, FxHashMap<String, ValueIdSet>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionKind {
+    Array,
+    Set,
+    Map,
+}
+
+impl CollectionKind {
+    fn insertion_method(self) -> &'static str {
+        match self {
+            Self::Array => "push",
+            Self::Set => "add",
+            Self::Map => "set",
+        }
+    }
+
+    fn insertion_signature(self) -> &'static str {
+        match self {
+            Self::Array => "Array.push",
+            Self::Set => "Set.add",
+            Self::Map => "Map.set",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstantKind {
+    String,
+    Number,
+    Boolean,
+    Null,
+    Undefined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Constant {
+    text: String,
+    kind: ConstantKind,
+}
+
+impl Constant {
+    fn positive_array_length(&self) -> bool {
+        let number = match self.kind {
+            ConstantKind::String | ConstantKind::Number => self.text.as_str().string_to_number(),
+            ConstantKind::Boolean => {
+                if self.text == "true" {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ConstantKind::Null => 0.0,
+            ConstantKind::Undefined => f64::NAN,
+        };
+        number > 0.0 && number <= f64::from(u32::MAX) && number.fract() == 0.0
+    }
+}
+
 /// The abstract state tracked during inference.
 /// The pass has exclusive access to each state (interior mutability only via
 /// the `uninitialized_access` Cell).
@@ -480,10 +539,11 @@ struct InferenceState {
     /// Allocations that may denote the same runtime object.
     aliased_values: FxHashMap<ValueId, ValueIdSet>,
     known_properties: KnownProperties,
-    property_keys: FxHashMap<ValueId, String>,
+    property_keys: FxHashMap<ValueId, Constant>,
     exact_property_loads: FxHashSet<ValueId>,
-    builtin_array_push: FxHashSet<ValueId>,
-    default_array_prototypes: FxHashSet<ValueId>,
+    collection_kinds: FxHashMap<ValueId, CollectionKind>,
+    builtin_collection_insert: FxHashSet<ValueId>,
+    default_collection_prototypes: FxHashSet<ValueId>,
     /// Tracks uninitialized identifier access errors (matches TS invariant).
     /// Uses Cell so it can be set from `&self` methods like `kind()`.
     /// Stores (IdentifierId, usage_span) where usage_span is the source location
@@ -503,8 +563,9 @@ impl InferenceState {
             known_properties: KnownProperties::default(),
             property_keys: FxHashMap::default(),
             exact_property_loads: FxHashSet::default(),
-            builtin_array_push: FxHashSet::default(),
-            default_array_prototypes: FxHashSet::default(),
+            collection_kinds: FxHashMap::default(),
+            builtin_collection_insert: FxHashSet::default(),
+            default_collection_prototypes: FxHashSet::default(),
             uninitialized_access: Cell::new(None),
         }
     }
@@ -614,6 +675,10 @@ impl InferenceState {
     }
 
     fn property_key(&self, identifier: IdentifierId) -> Option<String> {
+        self.constant(identifier).map(|value| value.text)
+    }
+
+    fn constant(&self, identifier: IdentifierId) -> Option<Constant> {
         let values = self.variables.get(&identifier)?;
         let mut values = values.iter();
         let key = self.property_keys.get(&values.next()?)?;
@@ -690,7 +755,7 @@ impl InferenceState {
         merged
     }
 
-    fn merged_property_keys(&self, other: &Self) -> FxHashMap<ValueId, String> {
+    fn merged_property_keys(&self, other: &Self) -> FxHashMap<ValueId, Constant> {
         let mut keys = self.property_keys.clone();
         keys.retain(|id, key| {
             !other.values.contains_key(id) || other.property_keys.get(id) == Some(key)
@@ -704,7 +769,7 @@ impl InferenceState {
     }
 
     fn copy_nonempty_iterable(&mut self, from: IdentifierId, into: ValueId) {
-        if let Some(key) = self.property_key(from) {
+        if let Some(key) = self.constant(from) {
             self.property_keys.insert(into, key);
         } else {
             self.property_keys.remove(&into);
@@ -767,7 +832,7 @@ impl InferenceState {
     fn invalidate_nonempty_iterables(&mut self, place: IdentifierId, transitive: bool) {
         if self.nonempty_iterable_values.is_empty()
             && self.known_properties.is_empty()
-            && self.default_array_prototypes.is_empty()
+            && self.default_collection_prototypes.is_empty()
         {
             return;
         }
@@ -779,8 +844,8 @@ impl InferenceState {
             }
             self.nonempty_iterable_values.remove(&value);
             self.known_properties.remove(&value);
-            self.builtin_array_push.remove(&value);
-            self.default_array_prototypes.remove(&value);
+            self.builtin_collection_insert.remove(&value);
+            self.default_collection_prototypes.remove(&value);
             if let Some(aliases) = self.aliased_values.get(&value) {
                 pending.extend(aliases.iter());
             }
@@ -924,15 +989,17 @@ impl InferenceState {
         let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         let known_properties = self.merged_known_properties(other);
         let property_keys = self.merged_property_keys(other);
-        let builtin_array_push = self.merged_allocation_facts(
+        let mut collection_kinds = self.collection_kinds.clone();
+        collection_kinds.extend(other.collection_kinds.iter().map(|(&id, &kind)| (id, kind)));
+        let builtin_collection_insert = self.merged_allocation_facts(
             other,
-            &self.builtin_array_push,
-            &other.builtin_array_push,
+            &self.builtin_collection_insert,
+            &other.builtin_collection_insert,
         );
-        let default_array_prototypes = self.merged_allocation_facts(
+        let default_collection_prototypes = self.merged_allocation_facts(
             other,
-            &self.default_array_prototypes,
-            &other.default_array_prototypes,
+            &self.default_collection_prototypes,
+            &other.default_collection_prototypes,
         );
         let mut exact_property_loads = self.exact_property_loads.clone();
         exact_property_loads.retain(|value| {
@@ -948,9 +1015,10 @@ impl InferenceState {
             && nonempty_iterable_values == self.nonempty_iterable_values
             && known_properties == self.known_properties
             && property_keys == self.property_keys
+            && collection_kinds == self.collection_kinds
             && exact_property_loads == self.exact_property_loads
-            && builtin_array_push == self.builtin_array_push
-            && default_array_prototypes == self.default_array_prototypes
+            && builtin_collection_insert == self.builtin_collection_insert
+            && default_collection_prototypes == self.default_collection_prototypes
         {
             None
         } else {
@@ -961,9 +1029,10 @@ impl InferenceState {
                 nonempty_iterable_values,
                 known_properties,
                 property_keys,
+                collection_kinds,
                 exact_property_loads,
-                builtin_array_push,
-                default_array_prototypes,
+                builtin_collection_insert,
+                default_collection_prototypes,
                 captured_values: next_captured_values
                     .unwrap_or_else(|| self.captured_values.clone()),
                 aliased_values: next_aliased_values.unwrap_or_else(|| self.aliased_values.clone()),
@@ -1008,15 +1077,16 @@ impl InferenceState {
         self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         self.known_properties = self.merged_known_properties(other);
         self.property_keys = self.merged_property_keys(other);
-        self.builtin_array_push = self.merged_allocation_facts(
+        self.collection_kinds.extend(other.collection_kinds.iter().map(|(&id, &kind)| (id, kind)));
+        self.builtin_collection_insert = self.merged_allocation_facts(
             other,
-            &self.builtin_array_push,
-            &other.builtin_array_push,
+            &self.builtin_collection_insert,
+            &other.builtin_collection_insert,
         );
-        self.default_array_prototypes = self.merged_allocation_facts(
+        self.default_collection_prototypes = self.merged_allocation_facts(
             other,
-            &self.default_array_prototypes,
-            &other.default_array_prototypes,
+            &self.default_collection_prototypes,
+            &other.default_collection_prototypes,
         );
         self.exact_property_loads.retain(|value| {
             !other.values.contains_key(value) || other.exact_property_loads.contains(value)
@@ -1631,8 +1701,9 @@ fn update_iterable_properties(
 ) {
     if matches!(instruction.value, InstructionValue::ArrayExpression { .. }) {
         for value in state.values_for(instruction.lvalue.identifier) {
-            state.builtin_array_push.insert(value);
-            state.default_array_prototypes.insert(value);
+            state.collection_kinds.insert(value, CollectionKind::Array);
+            state.builtin_collection_insert.insert(value);
+            state.default_collection_prototypes.insert(value);
         }
     }
     if matches!(
@@ -1657,8 +1728,15 @@ fn update_iterable_properties(
                 PrimitiveValue::Null => "null".to_string(),
                 PrimitiveValue::Undefined => "undefined".to_string(),
             };
+            let kind = match value {
+                PrimitiveValue::String(_) => ConstantKind::String,
+                PrimitiveValue::Number(_) => ConstantKind::Number,
+                PrimitiveValue::Boolean(_) => ConstantKind::Boolean,
+                PrimitiveValue::Null => ConstantKind::Null,
+                PrimitiveValue::Undefined => ConstantKind::Undefined,
+            };
             for value in state.values_for(instruction.lvalue.identifier) {
-                state.property_keys.insert(value, key.clone());
+                state.property_keys.insert(value, Constant { text: key.clone(), kind });
             }
         }
         InstructionValue::ArrayExpression { elements, .. }
@@ -1851,6 +1929,38 @@ fn infer_block<'a>(
         // stores, phi joins, and mutations have been applied. A literal-only scan
         // cannot recognize [...local] or invalidate a mutated spread operand.
         let instruction = &func.instructions[instr_index];
+        let constructed_collection = if context.track_nonempty_iterables {
+            match &instruction.value {
+                InstructionValue::NewExpression { callee, .. }
+                | InstructionValue::CallExpression { callee, .. } => env
+                    .get_function_signature(&env.types[env.identifiers[callee.identifier].type_])
+                    .ok()
+                    .flatten()
+                    .and_then(|signature| match signature.canonical_name.as_deref() {
+                        Some("Array") => Some(CollectionKind::Array),
+                        Some("Set")
+                            if matches!(
+                                instruction.value,
+                                InstructionValue::NewExpression { .. }
+                            ) =>
+                        {
+                            Some(CollectionKind::Set)
+                        }
+                        Some("Map")
+                            if matches!(
+                                instruction.value,
+                                InstructionValue::NewExpression { .. }
+                            ) =>
+                        {
+                            Some(CollectionKind::Map)
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let nonempty_iterable = if context.track_nonempty_iterables {
             match &instruction.value {
                 InstructionValue::ArrayExpression { elements, .. } => {
@@ -1867,21 +1977,34 @@ fn infer_block<'a>(
                 InstructionValue::TemplateLiteral { quasis, .. } => Some(
                     quasis.iter().any(|quasi| quasi.cooked.is_some_and(|value| !value.is_empty())),
                 ),
-                InstructionValue::NewExpression { callee, args, .. }
-                    if env
-                        .get_function_signature(
-                            &env.types[env.identifiers[callee.identifier].type_],
-                        )
-                        .ok()
-                        .flatten()
-                        .is_some_and(|signature| {
-                            matches!(signature.canonical_name.as_deref(), Some("Set" | "Map"))
-                        }) =>
+                InstructionValue::NewExpression { args, .. }
+                | InstructionValue::CallExpression { args, .. }
+                    if constructed_collection.is_some() =>
                 {
-                    // Deduplication can reduce a nonempty collection to one
-                    // entry, but cannot make it empty.
-                    Some(matches!(args.first(), Some(PlaceOrSpread::Place(place))
-                        if state.is_nonempty_iterable(place.identifier)))
+                    if constructed_collection == Some(CollectionKind::Array) {
+                        // One numeric argument is a length; every other single
+                        // value is an element. Two explicit arguments always
+                        // create a nonempty array, even with additional spreads.
+                        Some(
+                            args.iter()
+                                .filter(|arg| matches!(arg, PlaceOrSpread::Place(_)))
+                                .count()
+                                >= 2
+                                || args.iter().any(|arg| match arg {
+                                    PlaceOrSpread::Place(place) => {
+                                        state.constant(place.identifier).is_some_and(|value| {
+                                            value.kind != ConstantKind::Number
+                                                || value.positive_array_length()
+                                        })
+                                    }
+                                    PlaceOrSpread::Spread(_) => false,
+                                }),
+                        )
+                    } else {
+                        // Deduplication cannot make a nonempty collection empty.
+                        Some(matches!(args.first(), Some(PlaceOrSpread::Place(place))
+                            if state.is_nonempty_iterable(place.identifier)))
+                    }
                 }
                 _ => None,
             }
@@ -1934,9 +2057,9 @@ fn infer_block<'a>(
             Vec::new()
         };
 
-        let mut preserved_push = Vec::new();
+        let mut preserved_insert = Vec::new();
         let mut preserved_prototypes = Vec::new();
-        let mut preserved_nonempty_arrays = Vec::new();
+        let mut preserved_nonempty_collections = Vec::new();
         if !is_load
             && let Some((object, Some(key))) = &property_access
             && key != "__proto__"
@@ -1954,43 +2077,44 @@ fn infer_block<'a>(
                 && key == "length"
                 && match &instruction.value {
                     InstructionValue::PropertyStore { value, .. }
-                    | InstructionValue::ComputedStore { value, .. } => {
-                        state.property_key(value.identifier).is_some_and(|value| {
-                            value.trim().parse::<u32>().is_ok_and(|length| length > 0)
-                        })
-                    }
+                    | InstructionValue::ComputedStore { value, .. } => state
+                        .constant(value.identifier)
+                        .is_some_and(|value| value.positive_array_length()),
                     _ => false,
                 };
             for value in objects.iter() {
-                if state.default_array_prototypes.contains(&value) {
+                let Some(&kind) = state.collection_kinds.get(&value) else { continue };
+                if state.default_collection_prototypes.contains(&value) {
                     preserved_prototypes.push(value);
                     // Ordinary own-property writes cannot shorten an array.
                     // Unknown keys and prototype changes remain conservative.
-                    if writes_index
-                        || writes_positive_length
-                        || (key != "length" && state.nonempty_iterable_values.contains(&value))
+                    if (kind == CollectionKind::Array && (writes_index || writes_positive_length))
+                        || ((kind != CollectionKind::Array || key != "length")
+                            && state.nonempty_iterable_values.contains(&value))
                     {
-                        preserved_nonempty_arrays.push(value);
+                        preserved_nonempty_collections.push(value);
                     }
                     if matches!(
                         instruction.value,
                         InstructionValue::PropertyDelete { .. }
                             | InstructionValue::ComputedDelete { .. }
-                    ) && key == "push"
+                    ) && key == kind.insertion_method()
                     {
-                        preserved_push.push(value);
+                        preserved_insert.push(value);
                     }
                 }
-                if key != "push" && state.builtin_array_push.contains(&value) {
-                    preserved_push.push(value);
+                if key != kind.insertion_method()
+                    && state.builtin_collection_insert.contains(&value)
+                {
+                    preserved_insert.push(value);
                 }
             }
         }
         // Apply signature
         let effects = apply_signature(context, state, *instr_idx, instruction, env)?;
-        state.builtin_array_push.extend(preserved_push);
-        state.default_array_prototypes.extend(preserved_prototypes);
-        state.nonempty_iterable_values.extend(preserved_nonempty_arrays);
+        state.builtin_collection_insert.extend(preserved_insert);
+        state.default_collection_prototypes.extend(preserved_prototypes);
+        state.nonempty_iterable_values.extend(preserved_nonempty_collections);
         if context.track_nonempty_iterables {
             update_iterable_properties(
                 state,
@@ -1999,6 +2123,13 @@ fn infer_block<'a>(
                 selected_values,
                 preserved_properties,
             );
+        }
+        if let Some(kind) = constructed_collection {
+            for value in state.values_for(instruction.lvalue.identifier) {
+                state.collection_kinds.insert(value, kind);
+                state.builtin_collection_insert.insert(value);
+                state.default_collection_prototypes.insert(value);
+            }
         }
         if let Some(nonempty) = nonempty_iterable
             && let Some(values) = state.variables.get(&instruction.lvalue.identifier)
@@ -2176,7 +2307,7 @@ fn apply_signature<'a>(
     };
     if let Some(roots) = prototype_object.and_then(|object| state.property_roots(object))
         && !roots.is_empty()
-        && roots.iter().all(|value| state.default_array_prototypes.contains(&value))
+        && roots.iter().all(|value| state.default_collection_prototypes.contains(&value))
     {
         apply_effect(
             context,
@@ -2655,34 +2786,48 @@ fn apply_effect_ref<'a>(
                 let ty = &env.types[type_id];
                 env.get_function_signature(ty).ok().flatten().cloned()
             });
-            let mut builtin_push_receivers = Vec::new();
+            let mut builtin_insert_receivers = Vec::new();
             if context.track_nonempty_iterables
-                && sig_owned
-                    .as_ref()
-                    .is_some_and(|sig| sig.canonical_name.as_deref() == Some("Array.push"))
+                && sig_owned.as_ref().is_some_and(|sig| {
+                    matches!(
+                        sig.canonical_name.as_deref(),
+                        Some("Array.push" | "Set.add" | "Map.set")
+                    )
+                })
             {
                 let receivers = state.property_roots(receiver.identifier).unwrap_or_default();
                 if !receivers.is_empty()
-                    && receivers.iter().all(|value| state.builtin_array_push.contains(&value))
+                    && receivers.iter().all(|value| {
+                        state.builtin_collection_insert.contains(&value)
+                            && state.collection_kinds.get(&value).is_some_and(|kind| {
+                                Some(kind.insertion_signature())
+                                    == sig_owned
+                                        .as_ref()
+                                        .and_then(|sig| sig.canonical_name.as_deref())
+                            })
+                    })
                 {
-                    builtin_push_receivers.extend(receivers.iter());
+                    builtin_insert_receivers.extend(receivers.iter());
                 } else {
-                    // Structural Array typing does not prove that an own push
-                    // property (or a changed prototype) still invokes the builtin.
+                    // Structural typing does not prove that an own method
+                    // or a changed prototype still invokes the builtin.
                     sig_owned = None;
                 }
             }
             if let Some(sig) = &sig_owned {
                 let preserved_nonempty_receiver_values = if context.track_nonempty_iterables
-                    && sig.canonical_name.as_deref() == Some("Array.push")
-                {
-                    let adds_element = args.iter().any(|arg| match arg {
-                        PlaceOrSpreadOrHole::Place(_) => true,
-                        PlaceOrSpreadOrHole::Hole => false,
-                        PlaceOrSpreadOrHole::Spread(spread) => {
-                            state.is_nonempty_iterable(spread.place.identifier)
-                        }
-                    });
+                    && matches!(
+                        sig.canonical_name.as_deref(),
+                        Some("Array.push" | "Set.add" | "Map.set")
+                    ) {
+                    let adds_element = sig.canonical_name.as_deref() != Some("Array.push")
+                        || args.iter().any(|arg| match arg {
+                            PlaceOrSpreadOrHole::Place(_) => true,
+                            PlaceOrSpreadOrHole::Hole => false,
+                            PlaceOrSpreadOrHole::Spread(spread) => {
+                                state.is_nonempty_iterable(spread.place.identifier)
+                            }
+                        });
                     let receivers = state.property_roots(receiver.identifier).unwrap_or_default();
                     let singleton = receivers.iter().count() == 1;
                     receivers
@@ -2721,8 +2866,10 @@ fn apply_effect_ref<'a>(
                             apply_effect(context, state, se, initialized, effects, env)?;
                         }
                         state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
-                        state.builtin_array_push.extend(builtin_push_receivers.iter().copied());
-                        state.default_array_prototypes.extend(builtin_push_receivers);
+                        state
+                            .builtin_collection_insert
+                            .extend(builtin_insert_receivers.iter().copied());
+                        state.default_collection_prototypes.extend(builtin_insert_receivers);
                         return Ok(());
                     }
                 }
@@ -2748,6 +2895,9 @@ fn apply_effect_ref<'a>(
                 for le in legacy_effects {
                     apply_effect(context, state, le, initialized, effects, env)?;
                 }
+                state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
+                state.builtin_collection_insert.extend(builtin_insert_receivers.iter().copied());
+                state.default_collection_prototypes.extend(builtin_insert_receivers);
             } else {
                 // No signature: default behavior
                 apply_effect(
