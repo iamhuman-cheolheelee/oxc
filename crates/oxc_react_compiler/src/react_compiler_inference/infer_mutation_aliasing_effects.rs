@@ -1925,12 +1925,23 @@ fn infer_block<'a>(
             && let Some((object, Some(key))) = &property_access
             && key != "__proto__"
         {
-            for value in state.property_roots(*object).unwrap_or_default().iter() {
+            let objects = state.property_roots(*object).unwrap_or_default();
+            let writes_index = objects.as_slice().len() == 1
+                && matches!(
+                    instruction.value,
+                    InstructionValue::PropertyStore { .. } | InstructionValue::ComputedStore { .. }
+                )
+                && key
+                    .parse::<u32>()
+                    .is_ok_and(|index| index != u32::MAX && index.to_string() == *key);
+            for value in objects.iter() {
                 if state.default_array_prototypes.contains(&value) {
                     preserved_prototypes.push(value);
                     // Ordinary own-property writes cannot shorten an array.
                     // Unknown keys and prototype changes remain conservative.
-                    if key != "length" && state.nonempty_iterable_values.contains(&value) {
+                    if writes_index
+                        || (key != "length" && state.nonempty_iterable_values.contains(&value))
+                    {
                         preserved_nonempty_arrays.push(value);
                     }
                     if matches!(
