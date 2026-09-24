@@ -1934,12 +1934,24 @@ fn infer_block<'a>(
                 && key
                     .parse::<u32>()
                     .is_ok_and(|index| index != u32::MAX && index.to_string() == *key);
+            let writes_positive_length = objects.as_slice().len() == 1
+                && key == "length"
+                && match &instruction.value {
+                    InstructionValue::PropertyStore { value, .. }
+                    | InstructionValue::ComputedStore { value, .. } => {
+                        state.property_key(value.identifier).is_some_and(|value| {
+                            value.trim().parse::<u32>().is_ok_and(|length| length > 0)
+                        })
+                    }
+                    _ => false,
+                };
             for value in objects.iter() {
                 if state.default_array_prototypes.contains(&value) {
                     preserved_prototypes.push(value);
                     // Ordinary own-property writes cannot shorten an array.
                     // Unknown keys and prototype changes remain conservative.
                     if writes_index
+                        || writes_positive_length
                         || (key != "length" && state.nonempty_iterable_values.contains(&value))
                     {
                         preserved_nonempty_arrays.push(value);
@@ -2128,6 +2140,42 @@ fn apply_signature<'a>(
 
     // Track which values we've already initialized
     let mut initialized: FxHashSet<IdentifierId> = FxHashSet::default();
+
+    // The inherited prototype of a fresh array is shared global state. Treating
+    // it as a fresh value would allow prototype writes to masquerade as local
+    // mutations and invalidate assumptions about every array's builtin methods.
+    let prototype_object = match &instr.value {
+        InstructionValue::PropertyLoad { object, property, .. }
+            if context.track_nonempty_iterables && property.to_string() == "__proto__" =>
+        {
+            Some(object.identifier)
+        }
+        InstructionValue::ComputedLoad { object, property, .. }
+            if context.track_nonempty_iterables
+                && state.property_key(property.identifier).as_deref() == Some("__proto__") =>
+        {
+            Some(object.identifier)
+        }
+        _ => None,
+    };
+    if let Some(roots) = prototype_object.and_then(|object| state.property_roots(object))
+        && !roots.is_empty()
+        && roots.iter().all(|value| state.default_array_prototypes.contains(&value))
+    {
+        apply_effect(
+            context,
+            state,
+            AliasingEffect::Create {
+                into: instr.lvalue,
+                value: ValueKind::Global,
+                reason: ValueReason::Global,
+            },
+            &mut initialized,
+            &mut effects,
+            env,
+        )?;
+        return Ok(Some(effects));
+    }
 
     // Get the cached signature effects
     let sig = Rc::clone(context.instruction_signature_cache.get(&instr_idx).unwrap());

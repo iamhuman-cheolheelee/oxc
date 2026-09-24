@@ -1,0 +1,41 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-prototype-read.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(8);
+	const { timestamp } = t0;
+	let args;
+	let proto;
+	if ($[0] !== timestamp) {
+		args = [];
+		proto = args.__proto__;
+		args.push(timestamp);
+		$[0] = timestamp;
+		$[1] = args;
+		$[2] = proto;
+	} else {
+		args = $[1];
+		proto = $[2];
+	}
+	let t1;
+	if ($[3] !== args) {
+		t1 = new Date(...args);
+		$[3] = args;
+		$[4] = t1;
+	} else {
+		t1 = $[4];
+	}
+	let t2;
+	if ($[5] !== proto || $[6] !== t1) {
+		t2 = [proto, t1];
+		$[5] = proto;
+		$[6] = t1;
+		$[7] = t2;
+	} else {
+		t2 = $[7];
+	}
+	return t2;
+}
