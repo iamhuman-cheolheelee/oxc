@@ -505,7 +505,7 @@ struct Constant {
 }
 
 impl Constant {
-    fn positive_array_length(&self) -> bool {
+    fn array_length(&self) -> Option<u32> {
         let number = match self.kind {
             ConstantKind::String | ConstantKind::Number => self.text.as_str().string_to_number(),
             ConstantKind::Boolean => {
@@ -518,7 +518,12 @@ impl Constant {
             ConstantKind::Null => 0.0,
             ConstantKind::Undefined => f64::NAN,
         };
-        number > 0.0 && number <= f64::from(u32::MAX) && number.fract() == 0.0
+        (number >= 0.0 && number <= f64::from(u32::MAX) && number.fract() == 0.0)
+            .then_some(number as u32)
+    }
+
+    fn positive_array_length(&self) -> bool {
+        self.array_length().is_some_and(|length| length > 0)
     }
 }
 
@@ -534,6 +539,8 @@ struct InferenceState {
     variables: FxHashMap<IdentifierId, ValueIdSet>,
     /// Values guaranteed nonempty on every incoming path where they exist.
     nonempty_iterable_values: FxHashSet<ValueId>,
+    /// Cardinality is capped at two: Array(0) is empty, but Array(0, x) is not.
+    multiple_iterable_values: FxHashSet<ValueId>,
     /// Values stored inside another allocation.
     captured_values: FxHashMap<ValueId, ValueIdSet>,
     /// Allocations that may denote the same runtime object.
@@ -558,6 +565,7 @@ impl InferenceState {
             values: FxHashMap::default(),
             variables: FxHashMap::default(),
             nonempty_iterable_values: FxHashSet::default(),
+            multiple_iterable_values: FxHashSet::default(),
             captured_values: FxHashMap::default(),
             aliased_values: FxHashMap::default(),
             known_properties: KnownProperties::default(),
@@ -650,8 +658,13 @@ impl InferenceState {
         }
     }
 
-    fn is_nonempty_value(&self, value: ValueId, visited: &mut FxHashSet<ValueId>) -> bool {
-        if self.nonempty_iterable_values.contains(&value) {
+    fn has_allocation_fact(
+        &self,
+        value: ValueId,
+        visited: &mut FxHashSet<ValueId>,
+        facts: &FxHashSet<ValueId>,
+    ) -> bool {
+        if facts.contains(&value) {
             return true;
         }
         if !visited.insert(value) {
@@ -660,7 +673,7 @@ impl InferenceState {
         let result = self.exact_property_loads.contains(&value)
             && self.aliased_values.get(&value).is_some_and(|aliases| {
                 !aliases.is_empty()
-                    && aliases.iter().all(|alias| self.is_nonempty_value(alias, visited))
+                    && aliases.iter().all(|alias| self.has_allocation_fact(alias, visited, facts))
             });
         visited.remove(&value);
         result
@@ -670,7 +683,57 @@ impl InferenceState {
         self.variables.get(&place_id).is_some_and(|values| {
             let mut visited = FxHashSet::default();
             !values.is_empty()
-                && values.iter().all(|value| self.is_nonempty_value(value, &mut visited))
+                && values.iter().all(|value| {
+                    self.has_allocation_fact(value, &mut visited, &self.nonempty_iterable_values)
+                })
+        })
+    }
+
+    fn minimum_iterable_length(&self, identifier: IdentifierId) -> usize {
+        if !self.is_nonempty_iterable(identifier) {
+            return 0;
+        }
+        let multiple = self.values_for(identifier).iter().all(|&value| {
+            self.has_allocation_fact(
+                value,
+                &mut FxHashSet::default(),
+                &self.multiple_iterable_values,
+            )
+        });
+        if multiple { 2 } else { 1 }
+    }
+
+    fn minimum_argument_count(&self, args: &[PlaceOrSpread]) -> usize {
+        args.iter()
+            .map(|arg| match arg {
+                PlaceOrSpread::Place(_) => 1,
+                PlaceOrSpread::Spread(spread) => {
+                    self.minimum_iterable_length(spread.place.identifier)
+                }
+            })
+            .fold(0, |count, next| (count + next).min(2))
+    }
+
+    fn array_argument_is_nonzero(&self, argument: IdentifierId) -> bool {
+        self.constant(argument).is_some_and(|value| {
+            value.kind != ConstantKind::Number || value.positive_array_length()
+        })
+    }
+
+    fn array_spread_has_nonzero_argument(&self, spread: IdentifierId) -> bool {
+        if self.minimum_iterable_length(spread) == 0 {
+            return false;
+        }
+        if self.constant(spread).is_some_and(|value| value.kind == ConstantKind::String) {
+            return true;
+        }
+        self.select_property(spread, "0").is_some_and(|values| {
+            !values.is_empty()
+                && values.iter().all(|value| {
+                    self.property_keys.get(&value).is_some_and(|value| {
+                        value.kind != ConstantKind::Number || value.positive_array_length()
+                    })
+                })
         })
     }
 
@@ -769,6 +832,11 @@ impl InferenceState {
     }
 
     fn copy_nonempty_iterable(&mut self, from: IdentifierId, into: ValueId) {
+        if self.minimum_iterable_length(from) >= 2 {
+            self.multiple_iterable_values.insert(into);
+        } else {
+            self.multiple_iterable_values.remove(&into);
+        }
         if let Some(key) = self.constant(from) {
             self.property_keys.insert(into, key);
         } else {
@@ -843,6 +911,7 @@ impl InferenceState {
                 continue;
             }
             self.nonempty_iterable_values.remove(&value);
+            self.multiple_iterable_values.remove(&value);
             self.known_properties.remove(&value);
             self.builtin_collection_insert.remove(&value);
             self.default_collection_prototypes.remove(&value);
@@ -987,6 +1056,11 @@ impl InferenceState {
         }
 
         let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
+        let multiple_iterable_values = self.merged_allocation_facts(
+            other,
+            &self.multiple_iterable_values,
+            &other.multiple_iterable_values,
+        );
         let known_properties = self.merged_known_properties(other);
         let property_keys = self.merged_property_keys(other);
         let mut collection_kinds = self.collection_kinds.clone();
@@ -1013,6 +1087,7 @@ impl InferenceState {
             && next_captured_values.is_none()
             && next_aliased_values.is_none()
             && nonempty_iterable_values == self.nonempty_iterable_values
+            && multiple_iterable_values == self.multiple_iterable_values
             && known_properties == self.known_properties
             && property_keys == self.property_keys
             && collection_kinds == self.collection_kinds
@@ -1027,6 +1102,7 @@ impl InferenceState {
                 values: next_values.unwrap_or_else(|| self.values.clone()),
                 variables: next_variables.unwrap_or_else(|| self.variables.clone()),
                 nonempty_iterable_values,
+                multiple_iterable_values,
                 known_properties,
                 property_keys,
                 collection_kinds,
@@ -1075,6 +1151,11 @@ impl InferenceState {
     /// carry a set flag: a set flag errors out before the state is queued).
     fn merge_from(&mut self, other: &InferenceState) {
         self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
+        self.multiple_iterable_values = self.merged_allocation_facts(
+            other,
+            &self.multiple_iterable_values,
+            &other.multiple_iterable_values,
+        );
         self.known_properties = self.merged_known_properties(other);
         self.property_keys = self.merged_property_keys(other);
         self.collection_kinds.extend(other.collection_kinds.iter().map(|(&id, &kind)| (id, kind)));
@@ -1932,7 +2013,8 @@ fn infer_block<'a>(
         let constructed_collection = if context.track_nonempty_iterables {
             match &instruction.value {
                 InstructionValue::NewExpression { callee, .. }
-                | InstructionValue::CallExpression { callee, .. } => env
+                | InstructionValue::CallExpression { callee, .. }
+                | InstructionValue::MethodCall { property: callee, .. } => env
                     .get_function_signature(&env.types[env.identifiers[callee.identifier].type_])
                     .ok()
                     .flatten()
@@ -1979,25 +2061,20 @@ fn infer_block<'a>(
                 ),
                 InstructionValue::NewExpression { args, .. }
                 | InstructionValue::CallExpression { args, .. }
+                | InstructionValue::MethodCall { args, .. }
                     if constructed_collection.is_some() =>
                 {
                     if constructed_collection == Some(CollectionKind::Array) {
-                        // One numeric argument is a length; every other single
-                        // value is an element. Two explicit arguments always
-                        // create a nonempty array, even with additional spreads.
+                        // At least two arguments always mean elements. A single
+                        // argument may instead be the numeric length zero.
                         Some(
-                            args.iter()
-                                .filter(|arg| matches!(arg, PlaceOrSpread::Place(_)))
-                                .count()
-                                >= 2
+                            state.minimum_argument_count(args) >= 2
                                 || args.iter().any(|arg| match arg {
                                     PlaceOrSpread::Place(place) => {
-                                        state.constant(place.identifier).is_some_and(|value| {
-                                            value.kind != ConstantKind::Number
-                                                || value.positive_array_length()
-                                        })
+                                        state.array_argument_is_nonzero(place.identifier)
                                     }
-                                    PlaceOrSpread::Spread(_) => false,
+                                    PlaceOrSpread::Spread(spread) => state
+                                        .array_spread_has_nonzero_argument(spread.place.identifier),
                                 }),
                         )
                     } else {
@@ -2011,6 +2088,50 @@ fn infer_block<'a>(
         } else {
             None
         };
+
+        let multiple_iterable = context.track_nonempty_iterables
+            && match &instruction.value {
+                InstructionValue::ArrayExpression { elements, .. } => {
+                    elements
+                        .iter()
+                        .map(|element| match element {
+                            ArrayElement::Spread(spread) => {
+                                state.minimum_iterable_length(spread.place.identifier)
+                            }
+                            _ => 1,
+                        })
+                        .fold(0, |count, next| (count + next).min(2))
+                        >= 2
+                }
+                InstructionValue::Primitive { value: PrimitiveValue::String(value), .. } => {
+                    value.chars().take(2).count() >= 2
+                }
+                InstructionValue::TemplateLiteral { quasis, .. } => {
+                    quasis
+                        .iter()
+                        .filter_map(|quasi| quasi.cooked)
+                        .map(|value| value.chars().take(2).count())
+                        .sum::<usize>()
+                        >= 2
+                }
+                InstructionValue::NewExpression { args, .. }
+                | InstructionValue::CallExpression { args, .. }
+                | InstructionValue::MethodCall { args, .. }
+                    if constructed_collection == Some(CollectionKind::Array) =>
+                {
+                    state.minimum_argument_count(args) >= 2
+                        || args.iter().any(|arg| match arg {
+                            PlaceOrSpread::Place(place) => {
+                                state.constant(place.identifier).is_some_and(|value| {
+                                    value.kind == ConstantKind::Number
+                                        && value.array_length().is_some_and(|length| length >= 2)
+                                })
+                            }
+                            PlaceOrSpread::Spread(_) => false,
+                        })
+                }
+                _ => false,
+            };
 
         let property_access = context
             .track_nonempty_iterables
@@ -2060,6 +2181,7 @@ fn infer_block<'a>(
         let mut preserved_insert = Vec::new();
         let mut preserved_prototypes = Vec::new();
         let mut preserved_nonempty_collections = Vec::new();
+        let mut preserved_multiple = Vec::new();
         if !is_load
             && let Some((object, Some(key))) = &property_access
             && key != "__proto__"
@@ -2082,10 +2204,26 @@ fn infer_block<'a>(
                         .is_some_and(|value| value.positive_array_length()),
                     _ => false,
                 };
+            let writes_multiple_length = writes_positive_length
+                && match &instruction.value {
+                    InstructionValue::PropertyStore { value, .. }
+                    | InstructionValue::ComputedStore { value, .. } => state
+                        .constant(value.identifier)
+                        .and_then(|value| value.array_length())
+                        .is_some_and(|length| length >= 2),
+                    _ => false,
+                };
             for value in objects.iter() {
                 let Some(&kind) = state.collection_kinds.get(&value) else { continue };
                 if state.default_collection_prototypes.contains(&value) {
                     preserved_prototypes.push(value);
+                    if (kind == CollectionKind::Array
+                        && ((writes_index && key != "0") || writes_multiple_length))
+                        || ((kind != CollectionKind::Array || key != "length")
+                            && state.multiple_iterable_values.contains(&value))
+                    {
+                        preserved_multiple.push(value);
+                    }
                     // Ordinary own-property writes cannot shorten an array.
                     // Unknown keys and prototype changes remain conservative.
                     if (kind == CollectionKind::Array && (writes_index || writes_positive_length))
@@ -2115,6 +2253,7 @@ fn infer_block<'a>(
         state.builtin_collection_insert.extend(preserved_insert);
         state.default_collection_prototypes.extend(preserved_prototypes);
         state.nonempty_iterable_values.extend(preserved_nonempty_collections);
+        state.multiple_iterable_values.extend(preserved_multiple);
         if context.track_nonempty_iterables {
             update_iterable_properties(
                 state,
@@ -2135,6 +2274,11 @@ fn infer_block<'a>(
             && let Some(values) = state.variables.get(&instruction.lvalue.identifier)
         {
             for value in values.iter() {
+                if multiple_iterable {
+                    state.multiple_iterable_values.insert(value);
+                } else {
+                    state.multiple_iterable_values.remove(&value);
+                }
                 if nonempty {
                     state.nonempty_iterable_values.insert(value);
                 } else {
@@ -2288,26 +2432,35 @@ fn apply_signature<'a>(
     // Track which values we've already initialized
     let mut initialized: FxHashSet<IdentifierId> = FxHashSet::default();
 
-    // The inherited prototype of a fresh array is shared global state. Treating
-    // it as a fresh value would allow prototype writes to masquerade as local
-    // mutations and invalidate assumptions about every array's builtin methods.
+    // Inherited prototypes and constructors are shared global state. Both
+    // `value.__proto__` and `value.constructor.prototype` can mutate the builtin.
     let prototype_object = match &instr.value {
         InstructionValue::PropertyLoad { object, property, .. }
-            if context.track_nonempty_iterables && property.to_string() == "__proto__" =>
+            if context.track_nonempty_iterables
+                && matches!(property.to_string().as_str(), "__proto__" | "constructor") =>
         {
-            Some(object.identifier)
+            Some((object.identifier, property.to_string()))
         }
         InstructionValue::ComputedLoad { object, property, .. }
-            if context.track_nonempty_iterables
-                && state.property_key(property.identifier).as_deref() == Some("__proto__") =>
+            if context.track_nonempty_iterables =>
         {
-            Some(object.identifier)
+            state
+                .property_key(property.identifier)
+                .filter(|key| matches!(key.as_str(), "__proto__" | "constructor"))
+                .map(|key| (object.identifier, key))
         }
         _ => None,
     };
-    if let Some(roots) = prototype_object.and_then(|object| state.property_roots(object))
+    if let Some((object, key)) = prototype_object
+        && let Some(roots) = state.property_roots(object)
         && !roots.is_empty()
-        && roots.iter().all(|value| state.default_collection_prototypes.contains(&value))
+        && roots.iter().all(|value| {
+            state.default_collection_prototypes.contains(&value)
+                && !state
+                    .known_properties
+                    .get(&value)
+                    .is_some_and(|properties| properties.contains_key(&key))
+        })
     {
         apply_effect(
             context,
@@ -2840,6 +2993,36 @@ fn apply_effect_ref<'a>(
                 } else {
                     Vec::new()
                 };
+                let preserved_multiple_receiver_values = if !builtin_insert_receivers.is_empty() {
+                    let minimum_added = if sig.canonical_name.as_deref() == Some("Array.push") {
+                        args.iter()
+                            .map(|arg| match arg {
+                                PlaceOrSpreadOrHole::Place(_) => 1,
+                                PlaceOrSpreadOrHole::Hole => 0,
+                                PlaceOrSpreadOrHole::Spread(spread) => {
+                                    state.minimum_iterable_length(spread.place.identifier)
+                                }
+                            })
+                            .fold(0, |count, next| (count + next).min(2))
+                    } else {
+                        0
+                    };
+                    builtin_insert_receivers
+                        .iter()
+                        .copied()
+                        .filter(|value| {
+                            state.multiple_iterable_values.contains(value)
+                                || (builtin_insert_receivers.len() == 1
+                                    && minimum_added
+                                        + usize::from(
+                                            state.nonempty_iterable_values.contains(value),
+                                        )
+                                        >= 2)
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 // Check known_incompatible (TS line 2351-2370)
                 if let Some(ref incompatible_msg) = sig.known_incompatible
                     && env.enable_validations()
@@ -2866,6 +3049,7 @@ fn apply_effect_ref<'a>(
                             apply_effect(context, state, se, initialized, effects, env)?;
                         }
                         state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
+                        state.multiple_iterable_values.extend(preserved_multiple_receiver_values);
                         state
                             .builtin_collection_insert
                             .extend(builtin_insert_receivers.iter().copied());
@@ -2896,6 +3080,7 @@ fn apply_effect_ref<'a>(
                     apply_effect(context, state, le, initialized, effects, env)?;
                 }
                 state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
+                state.multiple_iterable_values.extend(preserved_multiple_receiver_values);
                 state.builtin_collection_insert.extend(builtin_insert_receivers.iter().copied());
                 state.default_collection_prototypes.extend(builtin_insert_receivers);
             } else {
