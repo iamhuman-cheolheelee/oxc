@@ -1,0 +1,22 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-new-date-mapped-mutated-source.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender
+function Component(t0) {
+	const $ = _c(1);
+	let t1;
+	if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
+		const source = [0, 1];
+		const args = source.map((value) => {
+			source.length = 0;
+			return value;
+		});
+		t1 = new Date(...args);
+		$[0] = t1;
+	} else {
+		t1 = $[0];
+	}
+	return t1;
+}

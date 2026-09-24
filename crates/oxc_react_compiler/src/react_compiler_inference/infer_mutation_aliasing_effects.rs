@@ -479,20 +479,25 @@ enum CollectionKind {
 }
 
 impl CollectionKind {
-    fn insertion_methods(self) -> u8 {
+    fn builtin_methods(self) -> u8 {
         match self {
-            Self::Array => insertion_method_bit("push") | insertion_method_bit("unshift"),
-            Self::Set => insertion_method_bit("add"),
-            Self::Map => insertion_method_bit("set"),
+            Self::Array => {
+                collection_method_bit("push")
+                    | collection_method_bit("unshift")
+                    | collection_method_bit("map")
+            }
+            Self::Set => collection_method_bit("add"),
+            Self::Map => collection_method_bit("set"),
         }
     }
 }
 
 /// Independent proofs let an own override invalidate only its matching builtin.
-fn insertion_method_bit(method: &str) -> u8 {
+fn collection_method_bit(method: &str) -> u8 {
     match method {
         "push" | "Array.push" => 1,
         "unshift" | "Array.unshift" => 2,
+        "map" | "Array.map" => 16,
         "add" | "Set.add" => 4,
         "set" | "Map.set" => 8,
         _ => 0,
@@ -568,7 +573,7 @@ struct InferenceState {
     property_keys: FxHashMap<ValueId, Constant>,
     exact_property_loads: FxHashSet<ValueId>,
     collection_kinds: FxHashMap<ValueId, CollectionKind>,
-    builtin_collection_insert: FxHashMap<ValueId, u8>,
+    builtin_collection_methods: FxHashMap<ValueId, u8>,
     default_collection_prototypes: FxHashSet<ValueId>,
     /// Tracks uninitialized identifier access errors (matches TS invariant).
     /// Uses Cell so it can be set from `&self` methods like `kind()`.
@@ -591,7 +596,7 @@ impl InferenceState {
             property_keys: FxHashMap::default(),
             exact_property_loads: FxHashSet::default(),
             collection_kinds: FxHashMap::default(),
-            builtin_collection_insert: FxHashMap::default(),
+            builtin_collection_methods: FxHashMap::default(),
             default_collection_prototypes: FxHashSet::default(),
             uninitialized_access: Cell::new(None),
         }
@@ -1059,7 +1064,7 @@ impl InferenceState {
             self.nonempty_iterable_values.remove(&value);
             self.multiple_iterable_values.remove(&value);
             self.known_properties.remove(&value);
-            self.builtin_collection_insert.remove(&value);
+            self.builtin_collection_methods.remove(&value);
             self.default_collection_prototypes.remove(&value);
             if let Some(aliases) = self.aliased_values.get(&value) {
                 pending.extend(aliases.iter());
@@ -1211,7 +1216,7 @@ impl InferenceState {
         let property_keys = self.merged_property_keys(other);
         let mut collection_kinds = self.collection_kinds.clone();
         collection_kinds.extend(other.collection_kinds.iter().map(|(&id, &kind)| (id, kind)));
-        let builtin_collection_insert = self.merged_insertion_methods(other);
+        let builtin_collection_methods = self.merged_builtin_methods(other);
         let default_collection_prototypes = self.merged_allocation_facts(
             other,
             &self.default_collection_prototypes,
@@ -1234,7 +1239,7 @@ impl InferenceState {
             && property_keys == self.property_keys
             && collection_kinds == self.collection_kinds
             && exact_property_loads == self.exact_property_loads
-            && builtin_collection_insert == self.builtin_collection_insert
+            && builtin_collection_methods == self.builtin_collection_methods
             && default_collection_prototypes == self.default_collection_prototypes
         {
             None
@@ -1249,7 +1254,7 @@ impl InferenceState {
                 property_keys,
                 collection_kinds,
                 exact_property_loads,
-                builtin_collection_insert,
+                builtin_collection_methods,
                 default_collection_prototypes,
                 captured_values: next_captured_values
                     .unwrap_or_else(|| self.captured_values.clone()),
@@ -1259,15 +1264,16 @@ impl InferenceState {
         }
     }
 
-    fn merged_insertion_methods(&self, other: &Self) -> FxHashMap<ValueId, u8> {
-        let mut methods = self.builtin_collection_insert.clone();
+    fn merged_builtin_methods(&self, other: &Self) -> FxHashMap<ValueId, u8> {
+        let mut methods = self.builtin_collection_methods.clone();
         methods.retain(|value, methods| {
             if other.values.contains_key(value) {
-                *methods &= other.builtin_collection_insert.get(value).copied().unwrap_or_default();
+                *methods &=
+                    other.builtin_collection_methods.get(value).copied().unwrap_or_default();
             }
             *methods != 0
         });
-        methods.extend(other.builtin_collection_insert.iter().filter_map(|(&value, &bits)| {
+        methods.extend(other.builtin_collection_methods.iter().filter_map(|(&value, &bits)| {
             (!self.values.contains_key(&value)).then_some((value, bits))
         }));
         methods
@@ -1315,7 +1321,7 @@ impl InferenceState {
         self.known_properties = self.merged_known_properties(other);
         self.property_keys = self.merged_property_keys(other);
         self.collection_kinds.extend(other.collection_kinds.iter().map(|(&id, &kind)| (id, kind)));
-        self.builtin_collection_insert = self.merged_insertion_methods(other);
+        self.builtin_collection_methods = self.merged_builtin_methods(other);
         self.default_collection_prototypes = self.merged_allocation_facts(
             other,
             &self.default_collection_prototypes,
@@ -1937,9 +1943,7 @@ fn update_iterable_properties(
     if matches!(instruction.value, InstructionValue::ArrayExpression { .. }) {
         for value in state.values_for(instruction.lvalue.identifier) {
             state.collection_kinds.insert(value, CollectionKind::Array);
-            state
-                .builtin_collection_insert
-                .insert(value, CollectionKind::Array.insertion_methods());
+            state.builtin_collection_methods.insert(value, CollectionKind::Array.builtin_methods());
             state.default_collection_prototypes.insert(value);
         }
     }
@@ -2268,7 +2272,35 @@ fn infer_block<'a>(
         } else {
             None
         };
-        let constructed_collection = collection_constructor.map(|(kind, _)| kind);
+        // Array.map snapshots the source length before invoking callbacks. The
+        // result keeps that length even if callbacks shorten the source array.
+        let mapped_length = if context.track_nonempty_iterables
+            && let InstructionValue::MethodCall { receiver, property, .. } = &instruction.value
+            && env
+                .get_function_signature(&env.types[env.identifiers[property.identifier].type_])
+                .ok()
+                .flatten()
+                .is_some_and(|signature| signature.canonical_name.as_deref() == Some("Array.map"))
+            && let Some(receivers) = state.property_roots(receiver.identifier)
+            && !receivers.is_empty()
+            && receivers.iter().all(|value| {
+                state
+                    .builtin_collection_methods
+                    .get(&value)
+                    .is_some_and(|methods| methods & collection_method_bit("map") != 0)
+                    && state.default_collection_prototypes.contains(&value)
+                    && !state
+                        .known_properties
+                        .get(&value)
+                        .is_some_and(|properties| properties.contains_key("constructor"))
+            }) {
+            Some(state.minimum_iterable_length(receiver.identifier))
+        } else {
+            None
+        };
+        let constructed_collection = collection_constructor
+            .map(|(kind, _)| kind)
+            .or_else(|| mapped_length.map(|_| CollectionKind::Array));
         let array_factory = collection_constructor.and_then(|(_, factory)| factory);
         let nonempty_iterable = if context.track_nonempty_iterables {
             match &instruction.value {
@@ -2281,6 +2313,9 @@ fn infer_block<'a>(
                 InstructionValue::TemplateLiteral { quasis, .. } => Some(
                     quasis.iter().any(|quasi| quasi.cooked.is_some_and(|value| !value.is_empty())),
                 ),
+                InstructionValue::MethodCall { .. } if mapped_length.is_some() => {
+                    mapped_length.map(|length| length > 0)
+                }
                 InstructionValue::NewExpression { args, .. }
                 | InstructionValue::CallExpression { args, .. }
                 | InstructionValue::MethodCall { args, .. }
@@ -2331,6 +2366,9 @@ fn infer_block<'a>(
                         .map(|value| value.chars().take(2).count())
                         .sum::<usize>()
                         >= 2
+                }
+                InstructionValue::MethodCall { .. } if mapped_length.is_some() => {
+                    mapped_length.is_some_and(|length| length >= 2)
                 }
                 InstructionValue::NewExpression { args, .. }
                 | InstructionValue::CallExpression { args, .. }
@@ -2463,20 +2501,22 @@ fn infer_block<'a>(
                     {
                         preserved_nonempty_collections.push(value);
                     }
-                    if matches!(
-                        instruction.value,
-                        InstructionValue::PropertyDelete { .. }
-                            | InstructionValue::ComputedDelete { .. }
-                    ) {
-                        let restored = insertion_method_bit(key) & kind.insertion_methods();
+                    if objects.as_slice().len() == 1
+                        && matches!(
+                            instruction.value,
+                            InstructionValue::PropertyDelete { .. }
+                                | InstructionValue::ComputedDelete { .. }
+                        )
+                    {
+                        let restored = collection_method_bit(key) & kind.builtin_methods();
                         if restored != 0 {
                             preserved_insert.push((value, restored));
                         }
                     }
                 }
                 let methods =
-                    state.builtin_collection_insert.get(&value).copied().unwrap_or_default()
-                        & !insertion_method_bit(key);
+                    state.builtin_collection_methods.get(&value).copied().unwrap_or_default()
+                        & !collection_method_bit(key);
                 if methods != 0 {
                     if let Some((_, restored)) =
                         preserved_insert.last_mut().filter(|(id, _)| *id == value)
@@ -2492,7 +2532,7 @@ fn infer_block<'a>(
         let effects = apply_signature(context, state, *instr_idx, instruction, env)?;
         spread_effects.extend(effects.into_iter().flatten());
         let effects = (!spread_effects.is_empty()).then_some(spread_effects);
-        state.builtin_collection_insert.extend(preserved_insert);
+        state.builtin_collection_methods.extend(preserved_insert);
         state.default_collection_prototypes.extend(preserved_prototypes);
         state.nonempty_iterable_values.extend(preserved_nonempty_collections);
         state.multiple_iterable_values.extend(preserved_multiple);
@@ -2508,7 +2548,7 @@ fn infer_block<'a>(
         if let Some(kind) = constructed_collection {
             for value in state.values_for(instruction.lvalue.identifier) {
                 state.collection_kinds.insert(value, kind);
-                state.builtin_collection_insert.insert(value, kind.insertion_methods());
+                state.builtin_collection_methods.insert(value, kind.builtin_methods());
                 state.default_collection_prototypes.insert(value);
             }
         }
@@ -3196,9 +3236,9 @@ fn apply_effect_ref<'a>(
                         let method = sig_owned
                             .as_ref()
                             .and_then(|sig| sig.canonical_name.as_deref())
-                            .map_or(0, insertion_method_bit);
+                            .map_or(0, collection_method_bit);
                         state
-                            .builtin_collection_insert
+                            .builtin_collection_methods
                             .get(&value)
                             .is_some_and(|methods| methods & method != 0)
                     })
@@ -3213,7 +3253,7 @@ fn apply_effect_ref<'a>(
             let builtin_insert_proofs: Vec<_> = builtin_insert_receivers
                 .iter()
                 .filter_map(|value| {
-                    state.builtin_collection_insert.get(value).map(|&methods| (*value, methods))
+                    state.builtin_collection_methods.get(value).map(|&methods| (*value, methods))
                 })
                 .collect();
             if let Some(sig) = &sig_owned {
@@ -3323,7 +3363,7 @@ fn apply_effect_ref<'a>(
                         state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
                         state.multiple_iterable_values.extend(preserved_multiple_receiver_values);
                         state
-                            .builtin_collection_insert
+                            .builtin_collection_methods
                             .extend(builtin_insert_proofs.iter().copied());
                         state.default_collection_prototypes.extend(builtin_insert_receivers);
                         return Ok(());
@@ -3354,7 +3394,7 @@ fn apply_effect_ref<'a>(
                 }
                 state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
                 state.multiple_iterable_values.extend(preserved_multiple_receiver_values);
-                state.builtin_collection_insert.extend(builtin_insert_proofs.iter().copied());
+                state.builtin_collection_methods.extend(builtin_insert_proofs.iter().copied());
                 state.default_collection_prototypes.extend(builtin_insert_receivers);
             } else {
                 // No signature: default behavior
