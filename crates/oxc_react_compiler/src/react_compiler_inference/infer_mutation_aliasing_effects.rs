@@ -766,6 +766,9 @@ impl InferenceState {
 
     fn minimum_concat_arguments(&self, args: &[PlaceOrSpread]) -> usize {
         let consume = |values: &ValueIdSet, trust_objects: &mut bool| {
+            if values.is_empty() {
+                return 1;
+            }
             let primitive = values.iter().all(|value| {
                 self.values.get(&value).is_some_and(|value| value.kind == ValueKind::Primitive)
             });
@@ -992,12 +995,13 @@ impl InferenceState {
             return true;
         }
         self.select_property(spread, "0").is_some_and(|values| {
-            !values.is_empty()
-                && values.iter().all(|value| {
-                    self.property_keys.get(&value).is_some_and(|value| {
-                        value.kind != ConstantKind::Number || value.positive_array_length()
-                    })
+            // A known sparse slot has no value identity; spreading it yields
+            // undefined, which creates an element rather than a numeric length.
+            values.iter().all(|value| {
+                self.property_keys.get(&value).is_some_and(|value| {
+                    value.kind != ConstantKind::Number || value.positive_array_length()
                 })
+            })
         })
     }
 
@@ -2133,12 +2137,17 @@ fn update_iterable_properties(
             let fields: FxHashMap<_, _> = elements
                 .iter()
                 .enumerate()
-                .filter_map(|(index, element)| {
-                    let ArrayElement::Place(place) = element else { return None };
-                    Some((
-                        index.to_string(),
-                        state.variables.get(&place.identifier).cloned().unwrap_or_default(),
-                    ))
+                .map(|(index, element)| {
+                    let values = match element {
+                        ArrayElement::Place(place) => {
+                            state.variables.get(&place.identifier).cloned().unwrap_or_default()
+                        }
+                        // Keep a hole distinct from an unknown/missing property.
+                        // Its implicit undefined value has no allocation identity.
+                        ArrayElement::Hole => ValueIdSet::default(),
+                        ArrayElement::Spread(_) => unreachable!("spreads are excluded above"),
+                    };
+                    (index.to_string(), values)
                 })
                 .collect();
             for object in state.values_for(instruction.lvalue.identifier) {

@@ -1,0 +1,28 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-new-date-array-sparse-spread-join.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender
+function Component(t0) {
+	const $ = _c(4);
+	const { cond } = t0;
+	let t1;
+	if ($[0] !== cond) {
+		t1 = cond ? [,] : [1];
+		$[0] = cond;
+		$[1] = t1;
+	} else {
+		t1 = $[1];
+	}
+	const source = t1;
+	let t2;
+	if ($[2] !== source) {
+		t2 = new Date(...new Array(...source));
+		$[2] = source;
+		$[3] = t2;
+	} else {
+		t2 = $[3];
+	}
+	return t2;
+}

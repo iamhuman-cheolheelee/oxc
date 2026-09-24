@@ -1244,10 +1244,15 @@ impl<'a> Unifier<'a> {
         }
 
         if let (
-            Type::Function { return_type: ret_a, is_constructor: con_a, .. },
-            Type::Function { return_type: ret_b, is_constructor: con_b, .. },
+            Type::Function { return_type: ret_a, is_constructor: con_a, shape_id: shape_a },
+            Type::Function { return_type: ret_b, is_constructor: con_b, shape_id: shape_b },
         ) = (&t_a, &t_b)
-            && con_a == con_b
+            // Array has the same return type when called or constructed. Keep
+            // this distinction for other constructors, including Date.
+            && (con_a == con_b || [shape_a, shape_b].into_iter().flatten().any(|shape| {
+                shapes.get(shape).and_then(|shape| shape.function_type.as_ref())
+                    .is_some_and(|signature| signature.canonical_name.as_deref() == Some("Array"))
+            }))
         {
             self.unify(*ret_a.clone(), *ret_b.clone(), shapes)?;
         }

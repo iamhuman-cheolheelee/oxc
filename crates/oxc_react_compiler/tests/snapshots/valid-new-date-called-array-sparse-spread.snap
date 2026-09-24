@@ -1,0 +1,25 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-new-date-called-array-sparse-spread.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender
+function Component(t0) {
+	const $ = _c(2);
+	let t1;
+	if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
+		t1 = [,];
+		$[0] = t1;
+	} else {
+		t1 = $[0];
+	}
+	const source = t1;
+	let t2;
+	if ($[1] === Symbol.for("react.memo_cache_sentinel")) {
+		t2 = new Date(...Array(...source));
+		$[1] = t2;
+	} else {
+		t2 = $[1];
+	}
+	return t2;
+}
