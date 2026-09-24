@@ -486,6 +486,7 @@ impl CollectionKind {
                     | collection_method_bit("unshift")
                     | collection_method_bit("map")
                     | collection_method_bit("concat")
+                    | collection_method_bit("slice")
             }
             Self::Set => collection_method_bit("add"),
             Self::Map => collection_method_bit("set"),
@@ -500,6 +501,7 @@ fn collection_method_bit(method: &str) -> u8 {
         "unshift" | "Array.unshift" => 2,
         "map" | "Array.map" => 16,
         "concat" | "Array.concat" => 32,
+        "slice" | "Array.slice" => 64,
         "add" | "Set.add" => 4,
         "set" | "Map.set" => 8,
         _ => 0,
@@ -2443,7 +2445,8 @@ fn infer_block<'a>(
             None
         };
         // Map snapshots the source length before callbacks; concat copies the
-        // receiver before appending arguments. Both preserve its lower bound.
+        // receiver before appending arguments. An unbounded slice also copies
+        // the whole array. All three preserve the receiver's lower bound.
         let copied_array_length = if context.track_nonempty_iterables
             && let InstructionValue::MethodCall { receiver, property, args, .. } =
                 &instruction.value
@@ -2451,8 +2454,9 @@ fn infer_block<'a>(
                 .get_function_signature(&env.types[env.identifiers[property.identifier].type_])
                 .ok()
                 .flatten()
-            && let Some(method @ ("Array.map" | "Array.concat")) =
+            && let Some(method @ ("Array.map" | "Array.concat" | "Array.slice")) =
                 signature.canonical_name.as_deref()
+            && (method != "Array.slice" || args.is_empty())
             && let Some(receivers) = state.property_roots(receiver.identifier)
             && !receivers.is_empty()
             && receivers.iter().all(|value| {

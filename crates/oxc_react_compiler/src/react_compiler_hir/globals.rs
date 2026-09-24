@@ -541,6 +541,7 @@ const BUILTIN_SHAPE_DEFS: &[ShapeDef] = &[
             Method(
                 "slice",
                 MethodDef {
+                    canonical_name: Some("Array.slice"),
                     rest_param: Some(Effect::Read),
                     callee_effect: Effect::Capture,
                     return_type: TypeDef::Object(BUILT_IN_ARRAY_ID),
