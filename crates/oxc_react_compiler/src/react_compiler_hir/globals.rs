@@ -319,6 +319,26 @@ const FREEZE_ARGS_FN: MethodDef = MethodDef {
     ..MethodDef::DEFAULT
 };
 
+const ARRAY_INSERT_ALIASING: AliasingSignatureConfig = AliasingSignatureConfig {
+    receiver: "@receiver",
+    params: &[],
+    rest: Some("@rest"),
+    returns: "@returns",
+    temporaries: &[],
+    effects: &[
+        // Insertion directly mutates the array itself
+        AliasingEffectConfig::Mutate { value: "@receiver" },
+        // The arguments are captured into the array
+        AliasingEffectConfig::Capture { from: "@rest", into: "@receiver" },
+        // Returns the new length, a primitive
+        AliasingEffectConfig::Create {
+            into: "@returns",
+            value: ValueKind::Primitive,
+            reason: ValueReason::KnownReturnSignature,
+        },
+    ],
+};
+
 /// Array mapping methods capture their callback's return value into the result.
 const ARRAY_MAP_ALIASING: AliasingSignatureConfig = AliasingSignatureConfig {
     receiver: "@receiver",
@@ -501,25 +521,19 @@ const BUILTIN_SHAPE_DEFS: &[ShapeDef] = &[
                     return_type: TypeDef::Primitive,
                     return_value_kind: ValueKind::Primitive,
                     canonical_name: Some("Array.push"),
-                    aliasing: Some(&AliasingSignatureConfig {
-                        receiver: "@receiver",
-                        params: &[],
-                        rest: Some("@rest"),
-                        returns: "@returns",
-                        temporaries: &[],
-                        effects: &[
-                            // Push directly mutates the array itself
-                            AliasingEffectConfig::Mutate { value: "@receiver" },
-                            // The arguments are captured into the array
-                            AliasingEffectConfig::Capture { from: "@rest", into: "@receiver" },
-                            // Returns the new length, a primitive
-                            AliasingEffectConfig::Create {
-                                into: "@returns",
-                                value: ValueKind::Primitive,
-                                reason: ValueReason::KnownReturnSignature,
-                            },
-                        ],
-                    }),
+                    aliasing: Some(&ARRAY_INSERT_ALIASING),
+                    ..MethodDef::DEFAULT
+                },
+            ),
+            Method(
+                "unshift",
+                MethodDef {
+                    rest_param: Some(Effect::Capture),
+                    callee_effect: Effect::Store,
+                    return_type: TypeDef::Primitive,
+                    return_value_kind: ValueKind::Primitive,
+                    canonical_name: Some("Array.unshift"),
+                    aliasing: Some(&ARRAY_INSERT_ALIASING),
                     ..MethodDef::DEFAULT
                 },
             ),
