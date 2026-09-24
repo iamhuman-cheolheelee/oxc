@@ -1867,6 +1867,22 @@ fn infer_block<'a>(
                 InstructionValue::TemplateLiteral { quasis, .. } => Some(
                     quasis.iter().any(|quasi| quasi.cooked.is_some_and(|value| !value.is_empty())),
                 ),
+                InstructionValue::NewExpression { callee, args, .. }
+                    if env
+                        .get_function_signature(
+                            &env.types[env.identifiers[callee.identifier].type_],
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some_and(|signature| {
+                            matches!(signature.canonical_name.as_deref(), Some("Set" | "Map"))
+                        }) =>
+                {
+                    // Deduplication can reduce a nonempty collection to one
+                    // entry, but cannot make it empty.
+                    Some(matches!(args.first(), Some(PlaceOrSpread::Place(place))
+                        if state.is_nonempty_iterable(place.identifier)))
+                }
                 _ => None,
             }
         } else {
