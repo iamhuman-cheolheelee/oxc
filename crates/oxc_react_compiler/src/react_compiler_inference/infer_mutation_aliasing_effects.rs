@@ -193,6 +193,7 @@ pub fn infer_mutation_aliasing_effects<'a>(
                 matches!(&instruction.value, InstructionValue::NewExpression { args, .. }
                     if !args.is_empty() && args.iter().all(|arg| matches!(arg, PlaceOrSpread::Spread(_))))
             }),
+        evaluated_argument_counts: FxHashMap::default(),
         effect_value_id_cache: FxHashMap::default(),
         function_values: FxHashMap::default(),
         function_signature_cache: FxHashMap::default(),
@@ -1428,6 +1429,8 @@ struct Context<'a> {
     non_mutating_spreads: FxHashSet<IdentifierId>,
     /// Cardinality and capture facts are only needed for constructor purity checks.
     track_nonempty_iterables: bool,
+    /// Lower bounds snapshot each spread when consumed, before later iterators run.
+    evaluated_argument_counts: FxHashMap<IdentifierId, usize>,
     /// Cache of ValueIds keyed by effect key, ensuring stable allocation-site identity
     /// across fixpoint iterations. Mirrors TS `effectInstructionValueCache`.
     effect_value_id_cache: FxHashMap<EffectKey, ValueId>,
@@ -2121,6 +2124,68 @@ fn update_iterable_properties(
 // inferBlock
 // =============================================================================
 
+/// Evaluate iterator effects before inspecting a call's receiver or source.
+/// Earlier yielded arguments retain their cardinality if a later iterator mutates
+/// their former container. This also covers array literals feeding a later call.
+fn evaluate_spreads<'a>(
+    context: &mut Context<'a>,
+    state: &mut InferenceState,
+    instruction: &Instruction<'a>,
+    env: &mut Environment<'a>,
+) -> Result<Vec<AliasingEffect<'a>>, OxcDiagnostic> {
+    let mut effects = Vec::new();
+    if !context.track_nonempty_iterables {
+        return Ok(effects);
+    }
+    let arguments: Vec<_> = match &instruction.value {
+        InstructionValue::CallExpression { args, .. }
+        | InstructionValue::MethodCall { args, .. }
+        | InstructionValue::NewExpression { args, .. } => {
+            args.iter().map(place_or_spread_to_hole).collect()
+        }
+        InstructionValue::ArrayExpression { elements, .. } => elements
+            .iter()
+            .map(|element| match element {
+                ArrayElement::Place(place) => PlaceOrSpreadOrHole::Place(*place),
+                ArrayElement::Spread(spread) => PlaceOrSpreadOrHole::Spread(*spread),
+                ArrayElement::Hole => PlaceOrSpreadOrHole::Hole,
+            })
+            .collect(),
+        _ => return Ok(effects),
+    };
+    let mut count = 0;
+    let mut initialized = FxHashSet::default();
+    for argument in arguments {
+        let next = if let PlaceOrSpreadOrHole::Spread(spread) = argument {
+            let values = state.values_for(spread.place.identifier);
+            let builtin = !values.is_empty()
+                && values.iter().all(|&value| {
+                    state.has_allocation_fact(
+                        value,
+                        &mut FxHashSet::default(),
+                        &state.default_collection_prototypes,
+                    )
+                });
+            if !builtin {
+                apply_effect(
+                    context,
+                    state,
+                    AliasingEffect::MutateTransitiveConditionally { value: spread.place },
+                    &mut initialized,
+                    &mut effects,
+                    env,
+                )?;
+            }
+            state.minimum_iterable_length(spread.place.identifier)
+        } else {
+            1
+        };
+        count = (count + next).min(2);
+    }
+    context.evaluated_argument_counts.insert(instruction.lvalue.identifier, count);
+    Ok(effects)
+}
+
 fn infer_block<'a>(
     context: &mut Context<'a>,
     state: &mut InferenceState,
@@ -2163,6 +2228,9 @@ fn infer_block<'a>(
         // stores, phi joins, and mutations have been applied. A literal-only scan
         // cannot recognize [...local] or invalidate a mutated spread operand.
         let instruction = &func.instructions[instr_index];
+        let mut spread_effects = evaluate_spreads(context, state, instruction, env)?;
+        let minimum_arguments =
+            context.evaluated_argument_counts.get(&instruction.lvalue.identifier).copied();
         let collection_constructor = if context.track_nonempty_iterables {
             match &instruction.value {
                 InstructionValue::NewExpression { callee, .. }
@@ -2204,13 +2272,8 @@ fn infer_block<'a>(
         let array_factory = collection_constructor.and_then(|(_, factory)| factory);
         let nonempty_iterable = if context.track_nonempty_iterables {
             match &instruction.value {
-                InstructionValue::ArrayExpression { elements, .. } => {
-                    Some(elements.iter().any(|element| match element {
-                        ArrayElement::Spread(spread) => {
-                            state.is_nonempty_iterable(spread.place.identifier)
-                        }
-                        _ => true,
-                    }))
+                InstructionValue::ArrayExpression { .. } => {
+                    Some(minimum_arguments.unwrap_or(0) > 0)
                 }
                 InstructionValue::Primitive { value: PrimitiveValue::String(value), .. } => {
                     Some(!value.is_empty())
@@ -2227,13 +2290,15 @@ fn infer_block<'a>(
                         Some(if factory == ArrayFactory::From {
                             state.first_argument_minimum_iterable_length(args, true) > 0
                         } else {
-                            state.minimum_argument_count(args) > 0
+                            minimum_arguments.unwrap_or_else(|| state.minimum_argument_count(args))
+                                > 0
                         })
                     } else if constructed_collection == Some(CollectionKind::Array) {
                         // At least two arguments always mean elements. A single
                         // argument may instead be the numeric length zero.
                         Some(
-                            state.minimum_argument_count(args) >= 2
+                            minimum_arguments.unwrap_or_else(|| state.minimum_argument_count(args))
+                                >= 2
                                 || args.iter().any(|arg| match arg {
                                     PlaceOrSpread::Place(place) => {
                                         state.array_argument_is_nonzero(place.identifier)
@@ -2255,18 +2320,7 @@ fn infer_block<'a>(
 
         let multiple_iterable = context.track_nonempty_iterables
             && match &instruction.value {
-                InstructionValue::ArrayExpression { elements, .. } => {
-                    elements
-                        .iter()
-                        .map(|element| match element {
-                            ArrayElement::Spread(spread) => {
-                                state.minimum_iterable_length(spread.place.identifier)
-                            }
-                            _ => 1,
-                        })
-                        .fold(0, |count, next| (count + next).min(2))
-                        >= 2
-                }
+                InstructionValue::ArrayExpression { .. } => minimum_arguments.unwrap_or(0) >= 2,
                 InstructionValue::Primitive { value: PrimitiveValue::String(value), .. } => {
                     value.chars().take(2).count() >= 2
                 }
@@ -2289,10 +2343,11 @@ fn infer_block<'a>(
                             matches!(args.as_slice(), [PlaceOrSpread::Place(_)])
                                 && state.first_argument_minimum_iterable_length(args, true) >= 2
                         } else {
-                            state.minimum_argument_count(args) >= 2
+                            minimum_arguments.unwrap_or_else(|| state.minimum_argument_count(args))
+                                >= 2
                         }
                     } else {
-                        state.minimum_argument_count(args) >= 2
+                        minimum_arguments.unwrap_or_else(|| state.minimum_argument_count(args)) >= 2
                             || args.iter().any(|arg| match arg {
                                 PlaceOrSpread::Place(place) => {
                                     state.constant(place.identifier).is_some_and(|value| {
@@ -2435,6 +2490,8 @@ fn infer_block<'a>(
         }
         // Apply signature
         let effects = apply_signature(context, state, *instr_idx, instruction, env)?;
+        spread_effects.extend(effects.into_iter().flatten());
+        let effects = (!spread_effects.is_empty()).then_some(spread_effects);
         state.builtin_collection_insert.extend(preserved_insert);
         state.default_collection_prototypes.extend(preserved_prototypes);
         state.nonempty_iterable_values.extend(preserved_nonempty_collections);
@@ -3165,16 +3222,28 @@ fn apply_effect_ref<'a>(
                         sig.canonical_name.as_deref(),
                         Some("Array.push" | "Array.unshift" | "Set.add" | "Map.set")
                     ) {
-                    let adds_element = !matches!(
-                        sig.canonical_name.as_deref(),
-                        Some("Array.push" | "Array.unshift")
-                    ) || args.iter().any(|arg| match arg {
-                        PlaceOrSpreadOrHole::Place(_) => true,
-                        PlaceOrSpreadOrHole::Hole => false,
-                        PlaceOrSpreadOrHole::Spread(spread) => {
-                            state.is_nonempty_iterable(spread.place.identifier)
-                        }
-                    });
+                    let adds_element =
+                        context.evaluated_argument_counts.get(&into.identifier).map_or_else(
+                            || {
+                                !matches!(
+                                    sig.canonical_name.as_deref(),
+                                    Some("Array.push" | "Array.unshift")
+                                ) || args.iter().any(|arg| match arg {
+                                    PlaceOrSpreadOrHole::Place(_) => true,
+                                    PlaceOrSpreadOrHole::Hole => false,
+                                    PlaceOrSpreadOrHole::Spread(spread) => {
+                                        state.is_nonempty_iterable(spread.place.identifier)
+                                    }
+                                })
+                            },
+                            |&count| {
+                                count > 0
+                                    || !matches!(
+                                        sig.canonical_name.as_deref(),
+                                        Some("Array.push" | "Array.unshift")
+                                    )
+                            },
+                        );
                     let receivers = state.property_roots(receiver.identifier).unwrap_or_default();
                     let singleton = receivers.iter().count() == 1;
                     receivers
@@ -3192,15 +3261,21 @@ fn apply_effect_ref<'a>(
                         sig.canonical_name.as_deref(),
                         Some("Array.push" | "Array.unshift")
                     ) {
-                        args.iter()
-                            .map(|arg| match arg {
-                                PlaceOrSpreadOrHole::Place(_) => 1,
-                                PlaceOrSpreadOrHole::Hole => 0,
-                                PlaceOrSpreadOrHole::Spread(spread) => {
-                                    state.minimum_iterable_length(spread.place.identifier)
-                                }
+                        context
+                            .evaluated_argument_counts
+                            .get(&into.identifier)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                args.iter()
+                                    .map(|arg| match arg {
+                                        PlaceOrSpreadOrHole::Place(_) => 1,
+                                        PlaceOrSpreadOrHole::Hole => 0,
+                                        PlaceOrSpreadOrHole::Spread(spread) => {
+                                            state.minimum_iterable_length(spread.place.identifier)
+                                        }
+                                    })
+                                    .fold(0, |count, next| (count + next).min(2))
                             })
-                            .fold(0, |count, next| (count + next).min(2))
                     } else {
                         0
                     };
@@ -3267,6 +3342,7 @@ fn apply_effect_ref<'a>(
                     span.as_ref(),
                     env,
                     &context.function_values,
+                    context.evaluated_argument_counts.get(&into.identifier).copied(),
                     &mut todo_errors,
                 );
                 // Todo errors should short-circuit (TS throws throwTodo)
@@ -3893,6 +3969,7 @@ fn compute_effects_for_legacy_signature<'a>(
     span: Option<&Span>,
     env: &Environment<'a>,
     function_values: &FxHashMap<ValueId, FunctionId>,
+    evaluated_argument_count: Option<usize>,
     todo_errors: &mut Vec<OxcDiagnostic>,
 ) -> Vec<AliasingEffect<'a>> {
     let return_value_reason = signature.return_value_reason.unwrap_or(ValueReason::Other);
@@ -3908,13 +3985,18 @@ fn compute_effects_for_legacy_signature<'a>(
         && env.config.validate_no_impure_functions_in_render
         && (!signature.impure_if_no_args
             || is_function_call
-            || args.iter().all(|arg| match arg {
-                PlaceOrSpreadOrHole::Place(_) => false,
-                PlaceOrSpreadOrHole::Hole => true,
-                PlaceOrSpreadOrHole::Spread(spread) => {
-                    !state.is_nonempty_iterable(spread.place.identifier)
-                }
-            }))
+            || evaluated_argument_count.map_or_else(
+                || {
+                    args.iter().all(|arg| match arg {
+                        PlaceOrSpreadOrHole::Place(_) => false,
+                        PlaceOrSpreadOrHole::Hole => true,
+                        PlaceOrSpreadOrHole::Spread(spread) => {
+                            !state.is_nonempty_iterable(spread.place.identifier)
+                        }
+                    })
+                },
+                |count| count == 0,
+            ))
     {
         let diagnostic =
             diagnostics::impure_function(signature.canonical_name.as_deref(), span.copied());
